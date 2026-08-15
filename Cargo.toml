@@ -1,0 +1,11 @@
+[package]
+name = "obolargus-cli"
+version = "0.1.0"
+description = "CLI for batch operations, backtesting, market data import, and headless evaluation"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+obolargus-core = { path = "../obolargus-core" }
+lx_engine = { path = "../lx_engine" }
+clap = { version = "4", features = ["derive"] }
