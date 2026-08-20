@@ -6,6 +6,6 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-obolargus-core = { path = "../obolargus-core" }
+obolargus-core = { path = "../obolargus_core" }
 lx_engine = { path = "../lx_engine" }
 clap = { version = "4", features = ["derive"] }
