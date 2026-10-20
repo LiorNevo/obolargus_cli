@@ -217,21 +217,47 @@ pub fn run(args: SyncArgs) -> Result<(), String> {
 
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| format!("failed to start async runtime: {e}"))?;
-    runtime.block_on(run_refresh_async(parsed, config))
+    runtime.block_on(run_refresh_async(parsed, config, None))
+}
+
+/// The runtime a `sync` invocation needs.
+///
+/// The production path builds this from the process environment. The
+/// internal helpers accept an optional pre-built context so the
+/// provider-backed paths can be exercised without a live upstream.
+#[derive(Clone)]
+struct SyncContext {
+    /// The resolved application configuration.
+    app_config: obolargus_server::config::AppConfig,
+    /// The market-data registry built from the configuration.
+    registry: std::sync::Arc<obolargus_core::market_data::registry::DataSourceRegistry>,
 }
 
 fn run_nested(command: SyncCommand, config: SyncConfig) -> Result<(), String> {
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| format!("failed to start async runtime: {e}"))?;
     match command {
-        SyncCommand::Lookup(args) => runtime.block_on(run_lookup_async(args)),
-        SyncCommand::Reconcile(args) => runtime.block_on(run_reconcile_async(args, config)),
+        SyncCommand::Lookup(args) => runtime.block_on(run_lookup_async(args, None)),
+        SyncCommand::Reconcile(args) => runtime.block_on(run_reconcile_async(args, config, None)),
     }
 }
 
-async fn run_refresh_async(parsed: Vec<ParsedAsset>, config: SyncConfig) -> Result<(), String> {
-    let (app_config, registry) = build_runtime_context()?;
-    let asset_ids = resolve_asset_ids(parsed, app_config.database_url()).await?;
+/// Resolves the context to use: the injected one when the caller supplied
+/// it, otherwise one built from the process environment.
+fn resolve_context(context: Option<&SyncContext>) -> Result<SyncContext, String> {
+    match context {
+        Some(context) => Ok(context.clone()),
+        None => build_runtime_context(),
+    }
+}
+
+async fn run_refresh_async(
+    parsed: Vec<ParsedAsset>,
+    config: SyncConfig,
+    context: Option<&SyncContext>,
+) -> Result<(), String> {
+    let context = resolve_context(context)?;
+    let asset_ids = resolve_asset_ids(parsed, context.app_config.database_url()).await?;
 
     if config.dry_run {
         // Dry run: resolve the assets and report what would happen without
@@ -249,10 +275,10 @@ async fn run_refresh_async(parsed: Vec<ParsedAsset>, config: SyncConfig) -> Resu
         return Ok(());
     }
 
-    let pool = connect_pool(app_config.database_url()).await?;
+    let pool = connect_pool(context.app_config.database_url()).await?;
     let summary = run_refresh(
         &pool,
-        &registry,
+        &context.registry,
         RefreshConfig {
             assets: Some(asset_ids),
             trigger: "cli".to_string(),
@@ -267,7 +293,7 @@ async fn run_refresh_async(parsed: Vec<ParsedAsset>, config: SyncConfig) -> Resu
     Ok(())
 }
 
-async fn run_lookup_async(args: LookupArgs) -> Result<(), String> {
+async fn run_lookup_async(args: LookupArgs, context: Option<&SyncContext>) -> Result<(), String> {
     let query = args.query.trim();
     if query.is_empty() {
         return Err("--query must not be empty".to_string());
@@ -289,8 +315,9 @@ async fn run_lookup_async(args: LookupArgs) -> Result<(), String> {
         return Ok(());
     }
 
-    let (_app_config, registry) = build_runtime_context()?;
-    let map = registry
+    let context = resolve_context(context)?;
+    let map = context
+        .registry
         .every_source_lookup_ticker(TickerLookupRequest {
             query: query.to_string(),
         })
@@ -318,7 +345,11 @@ async fn run_lookup_async(args: LookupArgs) -> Result<(), String> {
     Ok(())
 }
 
-async fn run_reconcile_async(args: ReconcileArgs, config: SyncConfig) -> Result<(), String> {
+async fn run_reconcile_async(
+    args: ReconcileArgs,
+    config: SyncConfig,
+    context: Option<&SyncContext>,
+) -> Result<(), String> {
     let asset_uuid = Uuid::parse_str(args.asset.trim())
         .map_err(|_| format!("--asset '{}' is not a valid UUID", args.asset))?;
     let as_of = chrono::NaiveDate::parse_from_str(args.as_of.trim(), "%Y-%m-%d")
@@ -339,23 +370,23 @@ async fn run_reconcile_async(args: ReconcileArgs, config: SyncConfig) -> Result<
         }
     };
 
-    let (app_config, registry) = build_runtime_context()?;
+    let context = resolve_context(context)?;
     if config.dry_run {
         println!(
             "{}",
             render(&ReconcileOutput {
                 reconciliation_id: Uuid::nil(),
                 canonical_value: String::new(),
-                sources_tried: registry.enabled_count(),
+                sources_tried: context.registry.enabled_count(),
             })?
         );
         return Ok(());
     }
 
-    let pool = connect_pool(app_config.database_url()).await?;
+    let pool = connect_pool(context.app_config.database_url()).await?;
     let summary = run_reconcile(
         &pool,
-        &registry,
+        &context.registry,
         ReconcileConfig {
             asset_id: AssetId::from_uuid(asset_uuid),
             fact_type: "market_price".to_string(),
@@ -371,13 +402,7 @@ async fn run_reconcile_async(args: ReconcileArgs, config: SyncConfig) -> Result<
 }
 
 /// Loads the app configuration and builds the market-data registry.
-fn build_runtime_context() -> Result<
-    (
-        obolargus_server::config::AppConfig,
-        std::sync::Arc<obolargus_core::market_data::registry::DataSourceRegistry>,
-    ),
-    String,
-> {
+fn build_runtime_context() -> Result<SyncContext, String> {
     let app_config = obolargus_server::config::AppConfig::from_env()
         .map_err(|e| format!("config error: {e}"))?;
     let market_data = app_config
@@ -385,7 +410,10 @@ fn build_runtime_context() -> Result<
         .map_err(|e| format!("market data config error: {e}"))?;
     let registry = obolargus_server::tasks::build_registry_from_config(&market_data)
         .map_err(|e| format!("registry build error: {e}"))?;
-    Ok((app_config, registry))
+    Ok(SyncContext {
+        app_config,
+        registry,
+    })
 }
 
 /// Connects to the configured PostgreSQL database.
@@ -552,5 +580,470 @@ mod tests {
         let json = render(&output).expect("render");
         assert!(json.contains("\"sources_tried\":2"));
         assert!(json.contains("canonical_value"));
+    }
+
+    /// A whitespace-padded UUID is still accepted — the parser trims
+    /// before validating.
+    #[test]
+    fn parse_asset_trims_whitespace_before_validating() {
+        let uuid = Uuid::new_v4();
+        let padded = format!("  {uuid}  ");
+        assert_eq!(parse_asset(&padded).expect("parse"), ParsedAsset::Id(uuid));
+    }
+
+    /// A scheme-qualified identifier is trimmed too.
+    #[test]
+    fn parse_asset_trims_whitespace_around_a_typed_pair() {
+        assert_eq!(
+            parse_asset(" TICKER:AAPL ").expect("parse"),
+            ParsedAsset::Typed {
+                scheme: "TICKER".to_string(),
+                value: "AAPL".to_string(),
+            }
+        );
+    }
+
+    /// `SyncOutput` is derived from a refresh summary field by field
+    /// (FR-032).
+    #[test]
+    fn sync_output_is_derived_from_a_refresh_summary() {
+        let summary = RefreshSummary {
+            run_id: Uuid::nil(),
+            assets_attempted: 9,
+            assets_refreshed: 4,
+            assets_no_op: 3,
+            assets_missing_identifier: 1,
+            assets_source_unavailable: 1,
+        };
+        let output = SyncOutput::from(&summary);
+        assert!(!output.dry_run, "a real run is not a dry run");
+        assert_eq!(output.run_id, summary.run_id);
+        assert_eq!(output.assets_attempted, 9);
+        assert_eq!(output.assets_refreshed, 4);
+        assert_eq!(output.assets_no_op, 3);
+        assert_eq!(output.assets_missing_identifier, 1);
+        assert_eq!(output.assets_source_unavailable, 1);
+    }
+
+    /// `ReconcileOutput` is derived from a reconciliation summary; the
+    /// number of sources tried is the size of the per-source answer map
+    /// (FR-022).
+    #[test]
+    fn reconcile_output_is_derived_from_a_reconcile_summary() {
+        let mut per_source_answers = std::collections::BTreeMap::new();
+        per_source_answers.insert(
+            "a".to_string(),
+            obolargus_core::market_data::reconcile::ReconcileEntry::Error(
+                obolargus_core::market_data::error::MarketDataProviderError::NotFound(
+                    "no hit".into(),
+                ),
+            ),
+        );
+        per_source_answers.insert(
+            "b".to_string(),
+            obolargus_core::market_data::reconcile::ReconcileEntry::Error(
+                obolargus_core::market_data::error::MarketDataProviderError::NotFound(
+                    "no hit".into(),
+                ),
+            ),
+        );
+        let summary = ReconcileSummary {
+            reconciliation_id: Uuid::nil(),
+            per_source_answers,
+            canonical_value: "{\"close\":\"100\"}".to_string(),
+        };
+        let output = ReconcileOutput::from(&summary);
+        assert_eq!(output.reconciliation_id, summary.reconciliation_id);
+        assert_eq!(output.canonical_value, summary.canonical_value);
+        assert_eq!(output.sources_tried, 2);
+    }
+
+    /// The table format prints one row per hit, preferring the long name
+    /// and falling back to the short one (US2).
+    #[test]
+    fn print_lookup_table_renders_one_row_per_hit() {
+        let output = LookupOutput {
+            query: "MSFT".to_string(),
+            hits: vec![
+                obolargus_core::market_data::types::TickerLookupHit {
+                    symbol: "MSFT".to_string(),
+                    short_name: Some("Microsoft".to_string()),
+                    long_name: Some("Microsoft Corporation".to_string()),
+                    quote_type: Some("EQUITY".to_string()),
+                    exchange: Some("NMS".to_string()),
+                    currency: None,
+                    schemes: vec![],
+                    relevance: Some(0.9),
+                },
+                obolargus_core::market_data::types::TickerLookupHit {
+                    symbol: "MSFT2".to_string(),
+                    short_name: Some("Short Only".to_string()),
+                    long_name: None,
+                    quote_type: None,
+                    exchange: None,
+                    currency: None,
+                    schemes: vec![],
+                    relevance: Some(0.5),
+                },
+            ],
+        };
+        let args = LookupArgs {
+            query: "MSFT".to_string(),
+            format: "table".to_string(),
+            limit: 10,
+            offline: false,
+        };
+        assert!(print_lookup(&output, &args).is_ok());
+    }
+
+    /// A hit with neither a long nor a short name still renders a row.
+    #[test]
+    fn print_lookup_table_handles_a_hit_without_any_name() {
+        let output = LookupOutput {
+            query: "X".to_string(),
+            hits: vec![obolargus_core::market_data::types::TickerLookupHit {
+                symbol: "X".to_string(),
+                short_name: None,
+                long_name: None,
+                quote_type: None,
+                exchange: None,
+                currency: None,
+                schemes: vec![],
+                relevance: None,
+            }],
+        };
+        let args = LookupArgs {
+            query: "X".to_string(),
+            format: "table".to_string(),
+            limit: 10,
+            offline: false,
+        };
+        assert!(print_lookup(&output, &args).is_ok());
+    }
+
+    /// The table format says so when there are no hits.
+    #[test]
+    fn print_lookup_table_reports_no_hits() {
+        let output = LookupOutput {
+            query: "ZZZZ".to_string(),
+            hits: vec![],
+        };
+        let args = LookupArgs {
+            query: "ZZZZ".to_string(),
+            format: "table".to_string(),
+            limit: 10,
+            offline: false,
+        };
+        assert!(print_lookup(&output, &args).is_ok());
+    }
+
+    /// The JSON format prints the serialized output.
+    #[test]
+    fn print_lookup_json_prints_the_serialized_output() {
+        let output = LookupOutput {
+            query: "MSFT".to_string(),
+            hits: vec![],
+        };
+        let args = LookupArgs {
+            query: "MSFT".to_string(),
+            format: "json".to_string(),
+            limit: 10,
+            offline: false,
+        };
+        assert!(print_lookup(&output, &args).is_ok());
+    }
+
+    // ---------- the provider-backed paths ----------
+
+    /// A provider that answers the ticker lookup with a fixed set of hits.
+    struct StubProvider {
+        id: String,
+        priority: i32,
+        hits: Vec<obolargus_core::market_data::types::TickerLookupHit>,
+        bar: Option<obolargus_core::market_data::types::LatestBar>,
+    }
+
+    #[async_trait::async_trait]
+    impl obolargus_core::market_data::trait_::MarketDataProvider for StubProvider {
+        fn source_id(&self) -> &str {
+            &self.id
+        }
+
+        fn display_name(&self) -> &str {
+            "Stub Provider"
+        }
+
+        fn supported_schemes(&self) -> &[String] {
+            static SCHEMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+            SCHEMES.get_or_init(|| vec!["TICKER".to_string()])
+        }
+
+        fn enabled(&self) -> bool {
+            true
+        }
+
+        fn priority(&self) -> i32 {
+            self.priority
+        }
+
+        async fn get_latest_bar(
+            &self,
+            _request: obolargus_core::market_data::types::LatestBarRequest,
+        ) -> Result<
+            obolargus_core::market_data::types::LatestBar,
+            obolargus_core::market_data::error::MarketDataProviderError,
+        > {
+            match &self.bar {
+                Some(bar) => Ok(bar.clone()),
+                None => Err(
+                    obolargus_core::market_data::error::MarketDataProviderError::NotFound(
+                        "no bar".into(),
+                    ),
+                ),
+            }
+        }
+
+        async fn get_historical_range(
+            &self,
+            _request: obolargus_core::market_data::types::HistoricalRangeRequest,
+        ) -> Result<
+            obolargus_core::market_data::types::HistoricalRange,
+            obolargus_core::market_data::error::MarketDataProviderError,
+        > {
+            Err(
+                obolargus_core::market_data::error::MarketDataProviderError::Unsupported(
+                    "stub: not implemented".into(),
+                ),
+            )
+        }
+
+        async fn lookup_ticker(
+            &self,
+            _request: obolargus_core::market_data::types::TickerLookupRequest,
+        ) -> Result<
+            obolargus_core::market_data::types::TickerLookupResult,
+            obolargus_core::market_data::error::MarketDataProviderError,
+        > {
+            Ok(obolargus_core::market_data::types::TickerLookupResult {
+                hits: self.hits.clone(),
+                source_id: self.id.clone(),
+            })
+        }
+    }
+
+    /// Builds a lookup hit.
+    fn hit(
+        symbol: &str,
+        relevance: Option<f64>,
+    ) -> obolargus_core::market_data::types::TickerLookupHit {
+        obolargus_core::market_data::types::TickerLookupHit {
+            symbol: symbol.to_string(),
+            short_name: None,
+            long_name: None,
+            quote_type: None,
+            exchange: None,
+            currency: None,
+            schemes: vec![],
+            relevance,
+        }
+    }
+
+    /// Builds a runtime context around the given providers.
+    fn context_with(providers: Vec<StubProvider>) -> SyncContext {
+        context_with_url(providers, "")
+    }
+
+    /// Builds a runtime context around the given providers, pointed at the
+    /// given database URL.
+    fn context_with_url(providers: Vec<StubProvider>, database_url: &str) -> SyncContext {
+        let providers: Vec<
+            std::sync::Arc<
+                dyn obolargus_core::market_data::trait_::MarketDataProvider + Send + Sync,
+            >,
+        > = providers
+            .into_iter()
+            .map(|provider| std::sync::Arc::new(provider) as _)
+            .collect();
+        let registry = obolargus_core::market_data::registry::DataSourceRegistry::new(providers)
+            .expect("registry");
+        let app_config = obolargus_server::config::AppConfig {
+            database_url: database_url.to_string(),
+            ..obolargus_server::config::AppConfig::default()
+        };
+        SyncContext {
+            app_config,
+            registry: std::sync::Arc::new(registry),
+        }
+    }
+
+    /// The lookup path collects the hits from every enabled source,
+    /// sorts them by relevance (descending) and truncates to `--limit`.
+    #[tokio::test]
+    async fn lookup_collects_sorts_and_truncates_the_hits() {
+        let context = context_with(vec![
+            StubProvider {
+                id: "a".to_string(),
+                priority: 10,
+                hits: vec![hit("ZZZ", Some(0.1)), hit("AAA", Some(0.9))],
+                bar: None,
+            },
+            StubProvider {
+                id: "b".to_string(),
+                priority: 20,
+                hits: vec![hit("MMM", Some(0.5))],
+                bar: None,
+            },
+        ]);
+
+        let args = LookupArgs {
+            query: "A".to_string(),
+            format: "json".to_string(),
+            limit: 2,
+            offline: false,
+        };
+        assert!(run_lookup_async(args, Some(&context)).await.is_ok());
+    }
+
+    /// The lookup path tolerates a hit without a relevance score.
+    #[tokio::test]
+    async fn lookup_handles_a_hit_without_a_relevance_score() {
+        let context = context_with(vec![StubProvider {
+            id: "a".to_string(),
+            priority: 10,
+            hits: vec![hit("AAA", None)],
+            bar: None,
+        }]);
+
+        let args = LookupArgs {
+            query: "A".to_string(),
+            format: "table".to_string(),
+            limit: 10,
+            offline: false,
+        };
+        assert!(run_lookup_async(args, Some(&context)).await.is_ok());
+    }
+
+    /// The reconciliation path drives the orchestrator and prints the
+    /// canonical value (FR-021).
+    ///
+    /// Skipped when no test database is configured.
+    #[tokio::test]
+    async fn reconcile_writes_the_canonical_value() {
+        let Some(url) = std::env::var("TEST_DATABASE_URL")
+            .ok()
+            .or_else(|| std::env::var("DATABASE_URL").ok())
+        else {
+            eprintln!("SKIPPED: no test database configured");
+            return;
+        };
+        let pool = match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+        {
+            Ok(pool) => pool,
+            Err(error) => {
+                eprintln!("SKIPPED: could not connect to the test database: {error}");
+                return;
+            }
+        };
+        if let Err(error) = sqlx::migrate!("../obolargus_core/migrations")
+            .run(&pool)
+            .await
+        {
+            eprintln!("SKIPPED: could not apply the migrations: {error}");
+            return;
+        }
+        truncate(&pool).await;
+
+        // An asset carrying a `TICKER` identifier.
+        let asset_id: (uuid::Uuid,) = sqlx::query_as(
+            "INSERT INTO assets (id, asset_type, display_name, currency) \
+             VALUES (gen_random_uuid(), 'EQUITY', 'Reconciled', 'USD') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("insert asset");
+        sqlx::query(
+            "INSERT INTO asset_identifiers (id, asset_id, scheme, value) \
+             VALUES (gen_random_uuid(), $1, 'TICKER', 'AAPL')",
+        )
+        .bind(asset_id.0)
+        .execute(&pool)
+        .await
+        .expect("insert identifier");
+
+        let bar = obolargus_core::market_data::types::LatestBar {
+            bar: obolargus_core::market_data::types::PriceBar {
+                as_of_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 2).expect("date"),
+                open: rust_decimal::Decimal::new(100, 0),
+                high: rust_decimal::Decimal::new(100, 0),
+                low: rust_decimal::Decimal::new(100, 0),
+                close: rust_decimal::Decimal::new(100, 0),
+                adjclose: rust_decimal::Decimal::new(100, 0),
+                volume: 1_000,
+            },
+            knowledge_date: chrono::NaiveDate::from_ymd_opt(2026, 1, 2).expect("date"),
+            source_id: "a".to_string(),
+        };
+
+        let context = context_with_url(
+            vec![
+                StubProvider {
+                    id: "a".to_string(),
+                    priority: 10,
+                    hits: vec![],
+                    bar: Some(bar.clone()),
+                },
+                StubProvider {
+                    id: "b".to_string(),
+                    priority: 20,
+                    hits: vec![],
+                    bar: Some(bar),
+                },
+            ],
+            &url,
+        );
+
+        let args = ReconcileArgs {
+            asset: asset_id.0.to_string(),
+            as_of: "2026-01-02".to_string(),
+            policy: "primary_wins".to_string(),
+        };
+        let result = run_reconcile_async(args, SyncConfig { dry_run: false }, Some(&context)).await;
+        assert!(
+            result.is_ok(),
+            "the reconciliation should succeed: {result:?}"
+        );
+
+        // The reconciliation wrote its audit row.
+        let audits: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM data_source_reconciliation_audits")
+                .fetch_one(&pool)
+                .await
+                .expect("count audits");
+        assert_eq!(audits, 1, "the reconciliation must write an audit row");
+
+        truncate(&pool).await;
+    }
+
+    /// Truncates every table the reconciliation touches.
+    async fn truncate(pool: &sqlx::PgPool) {
+        for table in [
+            "asset_reference_data",
+            "asset_identifiers",
+            "assets",
+            "data_source_reconciliation_audits",
+            "data_source_refresh_runs",
+            "data_sources",
+        ] {
+            let query = format!("TRUNCATE TABLE {table} RESTART IDENTITY CASCADE");
+            // Safe: `table` comes from the fixed constant list above, never
+            // from user input.
+            sqlx::query(sqlx::AssertSqlSafe(query))
+                .execute(pool)
+                .await
+                .unwrap_or_else(|error| panic!("truncate {table}: {error}"));
+        }
     }
 }

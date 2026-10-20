@@ -18,3 +18,15 @@ chrono.workspace = true
 envconfig = "0.11.1"
 dotenvy = "0.15.7"
 uuid = { version = "1.18", features = ["v4", "serde"] }
+
+# Integration tests under `tests/` link against the crate as an external
+# crate, so anything they `use` directly must also be a dev-dependency.
+# These mirror the regular dependencies above and add nothing to the
+# release build.
+[dev-dependencies]
+async-trait = "0.1"
+chrono.workspace = true
+rust_decimal.workspace = true
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "macros", "uuid", "migrate"] }
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
+uuid = { version = "1.18", features = ["v4", "serde"] }
