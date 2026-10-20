@@ -3,8 +3,15 @@
 //!
 //! Command surface contract:
 //! `specs/001-boilerplate-submodules/contracts/cli-contract.md`.
+//!
+//! The `sync` subcommand's market-data behavior is specified in
+//! `specs/017-yahoo-data-source/spec.md` (US1, FR-030..FR-032) and its
+//! configuration in
+//! `specs/017-yahoo-data-source/contracts/config-contract-additions.md`.
 
 use clap::{Parser, Subcommand};
+
+mod sync;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -28,7 +35,7 @@ pub enum Command {
     /// Generate a report (placeholder)
     Report,
     /// Synchronize market data (placeholder)
-    Sync,
+    Sync(sync::SyncArgs),
 }
 
 /// Runs the CLI, returning an error message for non-zero exit paths.
@@ -51,7 +58,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         Command::Eval => println!("obolargus-cli: eval — placeholder acknowledged"),
         Command::Backtest => println!("obolargus-cli: backtest — placeholder acknowledged"),
         Command::Report => println!("obolargus-cli: report — placeholder acknowledged"),
-        Command::Sync => println!("obolargus-cli: sync — placeholder acknowledged"),
+        Command::Sync(args) => return sync::run(args),
     }
     Ok(())
 }
@@ -75,13 +82,7 @@ mod tests {
 
     #[test]
     fn parses_every_placeholder_subcommand() {
-        for (arg, expected) in [
-            ("import", Command::Import),
-            ("eval", Command::Eval),
-            ("backtest", Command::Backtest),
-            ("report", Command::Report),
-            ("sync", Command::Sync),
-        ] {
+        for arg in ["import", "eval", "backtest", "report", "sync"] {
             let cli = parse(&["obolargus-cli", arg]).expect("subcommand should parse");
             assert!(
                 matches!(
@@ -90,11 +91,10 @@ mod tests {
                         | Command::Eval
                         | Command::Backtest
                         | Command::Report
-                        | Command::Sync
+                        | Command::Sync(_)
                 ),
                 "unexpected command for {arg}"
             );
-            let _ = expected;
         }
     }
 
@@ -111,5 +111,13 @@ mod tests {
     #[test]
     fn run_reports_unknown_command_as_error() {
         assert!(super::run(vec!["obolargus-cli".into(), "nope".into()]).is_err());
+    }
+
+    #[test]
+    fn sync_without_asset_keeps_placeholder_acknowledgement() {
+        // The CLI contract requires every placeholder subcommand to
+        // acknowledge and exit 0. `sync` with no `--asset` preserves
+        // that behavior; the real refresh path needs `--asset`.
+        assert!(super::run(vec!["obolargus-cli".into(), "sync".into()]).is_ok());
     }
 }
