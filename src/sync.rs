@@ -11,11 +11,14 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use obolargus_core::domain::id::{AssetId, DomainId};
+use obolargus_core::market_data::load::{
+    IdentifierLoadConfig, IdentifierLoadReport, run_identifier_load,
+};
 use obolargus_core::market_data::reconcile::{
     ReconcileConfig, ReconcileSummary, ReconciliationPolicy, run_reconcile,
 };
 use obolargus_core::market_data::refresh::{RefreshConfig, RefreshSummary, run_refresh};
-use obolargus_core::market_data::types::{TickerLookupHit, TickerLookupRequest};
+use obolargus_core::market_data::types::{TickerLookupHit, TickerLookupRequest, TypedIdentifier};
 
 /// Arguments for the `sync` subcommand.
 #[derive(Debug, Args, Default, Clone)]
@@ -37,6 +40,30 @@ pub enum SyncCommand {
     Lookup(LookupArgs),
     /// Reconcile one fact across the configured sources (US3b).
     Reconcile(ReconcileArgs),
+    /// Load reference data for a batch of identifiers as of one date (US2 of
+    /// spec 018).
+    Load(LoadArgs),
+}
+
+/// Arguments for `sync load`.
+///
+/// Implements FR-011 of `specs/018-load-reference-data/spec.md`.
+#[derive(Debug, Args, Clone)]
+pub struct LoadArgs {
+    /// One identifier, as `<type>:<value>` (e.g. `TICKER:XNAS:AAPL`). May be
+    /// repeated; one identifier per flag occurrence.
+    #[arg(long = "identifier", value_name = "IDENTIFIER")]
+    pub identifiers: Vec<String>,
+    /// The single as-of date (YYYY-MM-DD).
+    #[arg(long = "date", value_name = "YYYY-MM-DD")]
+    pub date: String,
+    /// A preferred upstream source id. It is consulted **first** for every
+    /// identifier; the normal fail-over continues when it cannot answer.
+    #[arg(long = "source", value_name = "SOURCE_ID")]
+    pub source: Option<String>,
+    /// Output format: `json` (default) or `table`.
+    #[arg(long = "format", value_name = "FORMAT", default_value = "json")]
+    pub format: String,
 }
 
 /// Arguments for `sync lookup`.
@@ -149,6 +176,133 @@ impl From<&ReconcileSummary> for ReconcileOutput {
     }
 }
 
+/// The JSON output of `sync load`.
+///
+/// Mirrors the API's response body field for field — the two surfaces are
+/// interchangeable witnesses of one shared operation (SC-002).
+///
+/// Implements FR-007 / FR-011 of `specs/018-load-reference-data/spec.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LoadOutput {
+    /// The report schema version.
+    pub report_version: u32,
+    /// The run's audit row id (`null` for a dry run).
+    pub run_id: Option<Uuid>,
+    /// Whether this was a dry run (nothing was persisted).
+    pub dry_run: bool,
+    /// The run's overall status.
+    pub status: obolargus_core::market_data::load::RunStatus,
+    /// The caller-named preferred source (`null` when none was named).
+    pub requested_source: Option<String>,
+    /// When the run started.
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    /// When the run ended.
+    pub ended_at: chrono::DateTime<chrono::Utc>,
+    /// The run's wall-clock duration.
+    pub duration_ms: u64,
+    /// The identifiers as received, before de-duplication.
+    pub identifiers_requested_raw: usize,
+    /// The repeated entries in the request.
+    pub identifiers_duplicated: usize,
+    /// The unique identifiers that reached the fetch stage.
+    pub identifiers_attempted: usize,
+    /// The outcome counters.
+    pub counters: LoadCounters,
+    /// Per-source attempt counts.
+    pub per_source_attempted: std::collections::BTreeMap<String, usize>,
+    /// Per-source failure counts.
+    pub per_source_failed: std::collections::BTreeMap<String, usize>,
+    /// One line per unique requested identifier.
+    pub identifiers: Vec<obolargus_core::market_data::load::LoadIdentifierOutcome>,
+}
+
+/// The outcome counters of a load run.
+///
+/// Implements FR-006 of `specs/018-load-reference-data/spec.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LoadCounters {
+    /// A row was written.
+    pub loaded: usize,
+    /// The identical fact was already known.
+    pub no_op: usize,
+    /// No asset claims the identifier.
+    pub not_resolved: usize,
+    /// The source holds no value for that date.
+    pub no_data_for_date: usize,
+    /// No enabled source claims the identifier's scheme.
+    pub unsupported_scheme: usize,
+    /// The source refused the request.
+    pub rejected: usize,
+    /// A transient or infrastructure failure.
+    pub source_unavailable: usize,
+    /// The source's budget was exhausted.
+    pub rate_limited: usize,
+    /// The store refused the write.
+    pub storage_failure: usize,
+}
+
+impl From<&IdentifierLoadReport> for LoadOutput {
+    fn from(report: &IdentifierLoadReport) -> Self {
+        Self {
+            report_version: report.report_version,
+            run_id: report.run_id,
+            dry_run: false,
+            status: report.status,
+            requested_source: report.requested_source.clone(),
+            started_at: report.started_at,
+            ended_at: report.ended_at,
+            duration_ms: report.duration_ms,
+            identifiers_requested_raw: report.identifiers_requested_raw,
+            identifiers_duplicated: report.identifiers_duplicated,
+            identifiers_attempted: report.identifiers_attempted,
+            counters: LoadCounters {
+                loaded: report.loaded,
+                no_op: report.no_op,
+                not_resolved: report.not_resolved,
+                no_data_for_date: report.no_data_for_date,
+                unsupported_scheme: report.unsupported_scheme,
+                rejected: report.rejected,
+                source_unavailable: report.source_unavailable,
+                rate_limited: report.rate_limited,
+                storage_failure: report.storage_failure,
+            },
+            per_source_attempted: report.per_source_attempted.clone(),
+            per_source_failed: report.per_source_failed.clone(),
+            identifiers: report.identifiers.clone(),
+        }
+    }
+}
+
+/// Parses an `--identifier` argument into a typed identifier.
+///
+/// The grammar splits at the **last** colon, so a venue-qualified type
+/// survives: `TICKER:XNAS:AAPL` is the type `TICKER:XNAS` and the value
+/// `AAPL`. The type is upper-cased; the value is trimmed and stays
+/// case-sensitive.
+///
+/// Implements FR-002 / FR-011 of `specs/018-load-reference-data/spec.md`.
+fn parse_identifier(raw: &str) -> Result<TypedIdentifier, String> {
+    let trimmed = raw.trim();
+    let Some((scheme, value)) = trimmed.rsplit_once(':') else {
+        return Err(format!(
+            "--identifier '{trimmed}' must be '<type>:<value>' (e.g. TICKER:AAPL)"
+        ));
+    };
+    let scheme = scheme.trim().to_uppercase();
+    let value = value.trim();
+    if scheme.is_empty() {
+        return Err(format!(
+            "--identifier '{trimmed}' has an empty type (expected '<type>:<value>')"
+        ));
+    }
+    if value.is_empty() {
+        return Err(format!(
+            "--identifier '{trimmed}' has an empty value (expected '<type>:<value>')"
+        ));
+    }
+    Ok(TypedIdentifier::new(scheme, value))
+}
+
 /// A parsed `--asset` argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ParsedAsset {
@@ -239,6 +393,7 @@ fn run_nested(command: SyncCommand, config: SyncConfig) -> Result<(), String> {
     match command {
         SyncCommand::Lookup(args) => runtime.block_on(run_lookup_async(args, None)),
         SyncCommand::Reconcile(args) => runtime.block_on(run_reconcile_async(args, config, None)),
+        SyncCommand::Load(args) => runtime.block_on(run_load_async(args, config, None)),
     }
 }
 
@@ -401,6 +556,114 @@ async fn run_reconcile_async(
     Ok(())
 }
 
+/// Runs `sync load`: loads reference data for a batch of identifiers as of
+/// one date and prints the execution report.
+///
+/// Implements FR-011 of `specs/018-load-reference-data/spec.md`.
+async fn run_load_async(
+    args: LoadArgs,
+    config: SyncConfig,
+    context: Option<&SyncContext>,
+) -> Result<(), String> {
+    if !matches!(args.format.as_str(), "json" | "table") {
+        return Err(format!(
+            "unknown --format '{}' (expected 'json' or 'table')",
+            args.format
+        ));
+    }
+
+    let identifiers: Vec<TypedIdentifier> = args
+        .identifiers
+        .iter()
+        .map(|raw| parse_identifier(raw))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if identifiers.is_empty() {
+        return Err("--identifier is required at least once".to_string());
+    }
+
+    let as_of_date = chrono::NaiveDate::parse_from_str(args.date.trim(), "%Y-%m-%d")
+        .map_err(|_| format!("--date '{}' is not a valid YYYY-MM-DD date", args.date))?;
+
+    let context = resolve_context(context)?;
+
+    if config.dry_run {
+        // A dry run persists nothing at all — no reference-data rows and no
+        // run record — and reports an empty run id (FR-008).
+        let output = LoadOutput {
+            report_version: 1,
+            run_id: None,
+            dry_run: true,
+            status: obolargus_core::market_data::load::RunStatus::Complete,
+            requested_source: args.source.clone(),
+            started_at: chrono::Utc::now(),
+            ended_at: chrono::Utc::now(),
+            duration_ms: 0,
+            identifiers_requested_raw: identifiers.len(),
+            identifiers_duplicated: 0,
+            identifiers_attempted: 0,
+            counters: LoadCounters {
+                loaded: 0,
+                no_op: 0,
+                not_resolved: 0,
+                no_data_for_date: 0,
+                unsupported_scheme: 0,
+                rejected: 0,
+                source_unavailable: 0,
+                rate_limited: 0,
+                storage_failure: 0,
+            },
+            per_source_attempted: std::collections::BTreeMap::new(),
+            per_source_failed: std::collections::BTreeMap::new(),
+            identifiers: Vec::new(),
+        };
+        print_load(&output, &args)?;
+        return Ok(());
+    }
+
+    let pool = connect_pool(context.app_config.database_url()).await?;
+    let report = run_identifier_load(
+        &pool,
+        &context.registry,
+        IdentifierLoadConfig {
+            identifiers,
+            as_of_date,
+            preferred_source: args.source.clone(),
+            trigger: "cli".to_string(),
+        },
+    )
+    .await
+    .map_err(|e| format!("load error: {e}"))?;
+
+    print_load(&LoadOutput::from(&report), &args)?;
+    Ok(())
+}
+
+/// Prints the load report in the requested format.
+fn print_load(output: &LoadOutput, args: &LoadArgs) -> Result<(), String> {
+    if args.format == "table" {
+        println!(
+            "{:<24} {:<38} {:<14} {:<20}",
+            "IDENTIFIER", "ASSET_ID", "OUTCOME", "SOURCE"
+        );
+        for line in &output.identifiers {
+            println!(
+                "{:<24} {:<38} {:<14} {:<20}",
+                format!("{}:{}", line.identifier.scheme, line.identifier.value),
+                line.asset_id.map(|id| id.to_string()).unwrap_or_default(),
+                serde_json::to_string(&line.outcome).unwrap_or_default(),
+                line.source_id.clone().unwrap_or_default(),
+            );
+        }
+        if output.identifiers.is_empty() {
+            println!("no identifiers");
+        }
+        return Ok(());
+    }
+    println!("{}", render(output)?);
+    Ok(())
+}
+
 /// Loads the app configuration and builds the market-data registry.
 fn build_runtime_context() -> Result<SyncContext, String> {
     let app_config = obolargus_server::config::AppConfig::from_env()
@@ -513,6 +776,102 @@ fn render<T: Serialize>(value: &T) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------- the `--identifier` grammar (spec 018 FR-002) ----------
+
+    /// `TICKER:AAPL` is the type `TICKER` and the value `AAPL`.
+    #[test]
+    fn parse_identifier_accepts_scheme_and_value() {
+        let parsed = parse_identifier("TICKER:AAPL").expect("parse");
+        assert_eq!(parsed, TypedIdentifier::new("TICKER", "AAPL"));
+    }
+
+    /// The split happens at the **last** colon, so a venue-qualified type
+    /// survives.
+    #[test]
+    fn parse_identifier_splits_at_the_last_colon() {
+        let parsed = parse_identifier("TICKER:XNAS:AAPL").expect("parse");
+        assert_eq!(parsed, TypedIdentifier::new("TICKER:XNAS", "AAPL"));
+    }
+
+    /// A bare value is rejected with a usage hint.
+    #[test]
+    fn parse_identifier_rejects_a_bare_value() {
+        let error = parse_identifier("AAPL").expect_err("bare value");
+        assert!(error.contains("<type>:<value>"), "got: {error}");
+    }
+
+    /// An empty value is rejected.
+    #[test]
+    fn parse_identifier_rejects_an_empty_value() {
+        let error = parse_identifier("TICKER:").expect_err("empty value");
+        assert!(error.contains("empty value"), "got: {error}");
+    }
+
+    /// An empty type is rejected.
+    #[test]
+    fn parse_identifier_rejects_an_empty_type() {
+        let error = parse_identifier(":AAPL").expect_err("empty type");
+        assert!(error.contains("empty type"), "got: {error}");
+    }
+
+    /// The type is upper-cased; the value keeps its case.
+    #[test]
+    fn parse_identifier_normalizes_the_type_but_not_the_value() {
+        let parsed = parse_identifier("ticker:aapl").expect("parse");
+        assert_eq!(parsed, TypedIdentifier::new("TICKER", "aapl"));
+    }
+
+    /// A whitespace-only value is rejected.
+    #[test]
+    fn parse_identifier_rejects_a_blank_value() {
+        assert!(parse_identifier("TICKER:   ").is_err());
+    }
+
+    /// The load arguments accept a repeated `--identifier` flag.
+    #[test]
+    fn load_args_accept_repeated_identifiers() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: LoadArgs,
+        }
+        let parsed = Wrapper::parse_from([
+            "test",
+            "--identifier",
+            "TICKER:AAPL",
+            "--identifier",
+            "TICKER:MSFT",
+            "--date",
+            "2026-10-24",
+        ]);
+        assert_eq!(parsed.args.identifiers.len(), 2);
+        assert_eq!(parsed.args.date, "2026-10-24");
+        assert!(parsed.args.source.is_none());
+        assert_eq!(parsed.args.format, "json");
+    }
+
+    /// The `--source` flag names the preferred source.
+    #[test]
+    fn load_args_accept_a_source_flag() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrapper {
+            #[command(flatten)]
+            args: LoadArgs,
+        }
+        let parsed = Wrapper::parse_from([
+            "test",
+            "--identifier",
+            "TICKER:AAPL",
+            "--date",
+            "2026-10-24",
+            "--source",
+            "yahoo_finance",
+        ]);
+        assert_eq!(parsed.args.source.as_deref(), Some("yahoo_finance"));
+    }
 
     #[test]
     fn parse_asset_accepts_uuid() {
