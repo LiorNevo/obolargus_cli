@@ -12,7 +12,11 @@ use uuid::Uuid;
 
 use obolargus_core::domain::id::{AssetId, DomainId};
 use obolargus_core::market_data::load::{
-    IdentifierLoadConfig, IdentifierLoadReport, run_identifier_load,
+    DEFAULT_ASSET_CURRENCY, IdentifierLoadConfig, IdentifierLoadReport, run_identifier_load,
+};
+use obolargus_core::market_data::load_range::{
+    IdentifierRangeLoadConfig, IdentifierRangeLoadReport, MAX_CONCURRENCY,
+    run_identifier_range_load,
 };
 use obolargus_core::market_data::reconcile::{
     ReconcileConfig, ReconcileSummary, ReconciliationPolicy, run_reconcile,
@@ -43,6 +47,9 @@ pub enum SyncCommand {
     /// Load reference data for a batch of identifiers as of one date (US2 of
     /// spec 018).
     Load(LoadArgs),
+    /// Load reference data for a batch of identifiers over a date range
+    /// (US5 of spec 018).
+    LoadRange(LoadRangeArgs),
 }
 
 /// Arguments for `sync load`.
@@ -61,6 +68,44 @@ pub struct LoadArgs {
     /// identifier; the normal fail-over continues when it cannot answer.
     #[arg(long = "source", value_name = "SOURCE_ID")]
     pub source: Option<String>,
+    /// Create an asset when the identifier resolves to none.
+    ///
+    /// The identifier must be a ticker scheme and the upstream must return
+    /// an **exact** symbol match; nothing is created on a fuzzy match or a
+    /// failed lookup.
+    #[arg(long = "create-missing-assets", default_value_t = false)]
+    pub create_missing_assets: bool,
+    /// Output format: `json` (default) or `table`.
+    #[arg(long = "format", value_name = "FORMAT", default_value = "json")]
+    pub format: String,
+}
+
+/// Arguments for `sync load-range`.
+///
+/// Implements FR-014 of `specs/018-load-reference-data/spec.md`.
+#[derive(Debug, Args, Clone)]
+pub struct LoadRangeArgs {
+    /// One identifier, as `<type>:<value>` (e.g. `TICKER:XNAS:AAPL`). May be
+    /// repeated; one identifier per flag occurrence.
+    #[arg(long = "identifier", value_name = "IDENTIFIER")]
+    pub identifiers: Vec<String>,
+    /// First date to load (inclusive, YYYY-MM-DD).
+    #[arg(long = "from", value_name = "YYYY-MM-DD")]
+    pub from: String,
+    /// Last date to load (inclusive, YYYY-MM-DD).
+    #[arg(long = "to", value_name = "YYYY-MM-DD")]
+    pub to: String,
+    /// The size of the concurrency window: at most this many dates in
+    /// flight at once.
+    #[arg(long = "concurrency", value_name = "N", default_value_t = 4)]
+    pub concurrency: usize,
+    /// A preferred upstream source id. It is consulted **first** for every
+    /// identifier; the normal fail-over continues when it cannot answer.
+    #[arg(long = "source", value_name = "SOURCE_ID")]
+    pub source: Option<String>,
+    /// Create an asset when an identifier resolves to none (FR-015).
+    #[arg(long = "create-missing-assets", default_value_t = false)]
+    pub create_missing_assets: bool,
     /// Output format: `json` (default) or `table`.
     #[arg(long = "format", value_name = "FORMAT", default_value = "json")]
     pub format: String,
@@ -239,6 +284,11 @@ pub struct LoadCounters {
     pub rate_limited: usize,
     /// The store refused the write.
     pub storage_failure: usize,
+    /// Assets created by this run (a side-effect counter, not an outcome).
+    pub assets_created: usize,
+    /// Assets adopted after a concurrent creation race (a side-effect
+    /// counter, not an outcome).
+    pub assets_adopted: usize,
 }
 
 impl From<&IdentifierLoadReport> for LoadOutput {
@@ -265,10 +315,36 @@ impl From<&IdentifierLoadReport> for LoadOutput {
                 source_unavailable: report.source_unavailable,
                 rate_limited: report.rate_limited,
                 storage_failure: report.storage_failure,
+                assets_created: report.assets_created,
+                assets_adopted: report.assets_adopted,
             },
             per_source_attempted: report.per_source_attempted.clone(),
             per_source_failed: report.per_source_failed.clone(),
             identifiers: report.identifiers.clone(),
+        }
+    }
+}
+
+/// The JSON output of `sync load-range`.
+///
+/// Wraps the core range report unchanged and adds the CLI-only `dry_run`
+/// flag, so the range report stays the contract's single source of truth.
+///
+/// Implements FR-014 of `specs/018-load-reference-data/spec.md`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RangeLoadOutput {
+    /// Whether this was a dry run (nothing was persisted).
+    pub dry_run: bool,
+    /// The range execution report.
+    #[serde(flatten)]
+    pub report: IdentifierRangeLoadReport,
+}
+
+impl From<&IdentifierRangeLoadReport> for RangeLoadOutput {
+    fn from(report: &IdentifierRangeLoadReport) -> Self {
+        Self {
+            dry_run: false,
+            report: report.clone(),
         }
     }
 }
@@ -394,6 +470,7 @@ fn run_nested(command: SyncCommand, config: SyncConfig) -> Result<(), String> {
         SyncCommand::Lookup(args) => runtime.block_on(run_lookup_async(args, None)),
         SyncCommand::Reconcile(args) => runtime.block_on(run_reconcile_async(args, config, None)),
         SyncCommand::Load(args) => runtime.block_on(run_load_async(args, config, None)),
+        SyncCommand::LoadRange(args) => runtime.block_on(run_load_range_async(args, config, None)),
     }
 }
 
@@ -605,6 +682,8 @@ async fn run_load_async(
             preferred_source: args.source.clone(),
             trigger: "cli".to_string(),
             dry_run: config.dry_run,
+            create_missing_assets: args.create_missing_assets,
+            default_currency: DEFAULT_ASSET_CURRENCY.to_string(),
         },
     )
     .await
@@ -641,6 +720,130 @@ fn print_load(output: &LoadOutput, args: &LoadArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// Runs `sync load-range`: loads reference data for a batch of identifiers
+/// over every calendar day in `--from..=--to`, with a size-`x` window.
+///
+/// Implements FR-014 of `specs/018-load-reference-data/spec.md`.
+async fn run_load_range_async(
+    args: LoadRangeArgs,
+    config: SyncConfig,
+    context: Option<&SyncContext>,
+) -> Result<(), String> {
+    if !matches!(args.format.as_str(), "json" | "table") {
+        return Err(format!(
+            "unknown --format '{}' (expected 'json' or 'table')",
+            args.format
+        ));
+    }
+
+    let identifiers: Vec<TypedIdentifier> = args
+        .identifiers
+        .iter()
+        .map(|raw| parse_identifier(raw))
+        .collect::<Result<Vec<_>, _>>()?;
+    if identifiers.is_empty() {
+        return Err("--identifier is required at least once".to_string());
+    }
+
+    let from = chrono::NaiveDate::parse_from_str(args.from.trim(), "%Y-%m-%d")
+        .map_err(|_| format!("--from '{}' is not a valid YYYY-MM-DD date", args.from))?;
+    let to = chrono::NaiveDate::parse_from_str(args.to.trim(), "%Y-%m-%d")
+        .map_err(|_| format!("--to '{}' is not a valid YYYY-MM-DD date", args.to))?;
+
+    // Validate the range itself before building the runtime context, so a
+    // bad request fails the same way with or without a configured database.
+    let today = chrono::Utc::now().date_naive();
+    if from > to {
+        return Err(format!("--from {from} is later than --to {to}"));
+    }
+    if to > today {
+        return Err(format!("--to {to} is later than today ({today})"));
+    }
+    if args.concurrency == 0 || args.concurrency > MAX_CONCURRENCY {
+        return Err(format!(
+            "--concurrency must be between 1 and {MAX_CONCURRENCY}, got {}",
+            args.concurrency
+        ));
+    }
+
+    let context = resolve_context(context)?;
+
+    let pool = if config.dry_run {
+        None
+    } else {
+        // The window is task-level, but each date holds a connection while
+        // it queries; size the pool so the window does not queue on it.
+        let connections = (args.concurrency.saturating_add(1)).min(u32::MAX as usize) as u32;
+        Some(connect_pool_sized(context.app_config.database_url(), connections.max(4)).await?)
+    };
+
+    let report = run_identifier_range_load(
+        pool.as_ref(),
+        &context.registry,
+        IdentifierRangeLoadConfig {
+            identifiers,
+            from,
+            to,
+            preferred_source: args.source.clone(),
+            trigger: "cli".to_string(),
+            dry_run: config.dry_run,
+            concurrency: args.concurrency,
+            create_missing_assets: args.create_missing_assets,
+            default_currency: DEFAULT_ASSET_CURRENCY.to_string(),
+        },
+    )
+    .await
+    .map_err(|e| format!("load-range error: {e}"))?;
+
+    let mut output = RangeLoadOutput::from(&report);
+    output.dry_run = config.dry_run;
+    print_load_range(&output, &args)?;
+    Ok(())
+}
+
+/// Prints the range report in the requested format.
+fn print_load_range(output: &RangeLoadOutput, args: &LoadRangeArgs) -> Result<(), String> {
+    if args.format == "table" {
+        println!(
+            "{:<12} {:<8} {:<8} {:<13} {:<9} {:<9} {:<9}",
+            "DATE", "LOADED", "NO_OP", "NOT_RESOLVED", "NO_DATA", "FAILED", "CREATED"
+        );
+        for section in &output.report.dates {
+            let report = &section.report;
+            println!(
+                "{:<12} {:<8} {:<8} {:<13} {:<9} {:<9} {:<9}",
+                section.date,
+                report.loaded,
+                report.no_op,
+                report.not_resolved,
+                report.no_data_for_date,
+                report.rejected
+                    + report.source_unavailable
+                    + report.rate_limited
+                    + report.storage_failure,
+                report.assets_created,
+            );
+        }
+        let totals = &output.report.totals;
+        println!(
+            "{:<12} {:<8} {:<8} {:<13} {:<9} {:<9} {:<9}",
+            "TOTAL",
+            totals.loaded,
+            totals.no_op,
+            totals.not_resolved,
+            totals.no_data_for_date,
+            totals.rejected
+                + totals.source_unavailable
+                + totals.rate_limited
+                + totals.storage_failure,
+            totals.assets_created,
+        );
+        return Ok(());
+    }
+    println!("{}", render(output)?);
+    Ok(())
+}
+
 /// Loads the app configuration and builds the market-data registry.
 fn build_runtime_context() -> Result<SyncContext, String> {
     let app_config = obolargus_server::config::AppConfig::from_env()
@@ -658,10 +861,18 @@ fn build_runtime_context() -> Result<SyncContext, String> {
 
 /// Connects to the configured PostgreSQL database.
 async fn connect_pool(url: Option<&str>) -> Result<sqlx::PgPool, String> {
+    connect_pool_sized(url, 4).await
+}
+
+/// Connects to the configured PostgreSQL database with a chosen pool size.
+async fn connect_pool_sized(
+    url: Option<&str>,
+    max_connections: u32,
+) -> Result<sqlx::PgPool, String> {
     let url = url
         .ok_or_else(|| "DATABASE_URL is not set; the sync refresh needs a database".to_string())?;
     sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
+        .max_connections(max_connections)
         .connect(url)
         .await
         .map_err(|e| format!("database connection error: {e}"))

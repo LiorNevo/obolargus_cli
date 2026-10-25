@@ -241,3 +241,118 @@ fn sync_accepts_the_documented_flags() {
         other => panic!("expected the sync command, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// `sync load-range` — FR-014 of spec 018
+// ---------------------------------------------------------------------------
+
+/// Builds the `sync load-range` arguments.
+fn load_range(
+    identifiers: &[&str],
+    from: &str,
+    to: &str,
+    concurrency: usize,
+    format: &str,
+) -> SyncArgs {
+    SyncArgs {
+        assets: Vec::new(),
+        command: Some(SyncCommand::LoadRange(obolargus_cli::sync::LoadRangeArgs {
+            identifiers: identifiers.iter().map(|s| s.to_string()).collect(),
+            from: from.to_string(),
+            to: to.to_string(),
+            concurrency,
+            source: None,
+            create_missing_assets: false,
+            format: format.to_string(),
+        })),
+    }
+}
+
+/// An unknown output format is rejected before any date is attempted.
+#[test]
+fn load_range_rejects_an_unknown_format() {
+    let error = obolargus_cli::sync::run(load_range(
+        &["TICKER:AAPL"],
+        "2026-10-01",
+        "2026-10-02",
+        2,
+        "xml",
+    ))
+    .expect_err("err");
+    assert_eq!(error, "unknown --format 'xml' (expected 'json' or 'table')");
+}
+
+/// At least one identifier is required.
+#[test]
+fn load_range_requires_an_identifier() {
+    let error = obolargus_cli::sync::run(load_range(&[], "2026-10-01", "2026-10-02", 2, "json"))
+        .expect_err("err");
+    assert_eq!(error, "--identifier is required at least once");
+}
+
+/// An unparseable `--from` is rejected.
+#[test]
+fn load_range_rejects_an_unparseable_from() {
+    let error = obolargus_cli::sync::run(load_range(
+        &["TICKER:AAPL"],
+        "10/01/2026",
+        "2026-10-02",
+        2,
+        "json",
+    ))
+    .expect_err("err");
+    assert!(error.contains("--from"), "error: {error}");
+}
+
+/// A reversed range is rejected before the database is needed.
+#[test]
+fn load_range_rejects_a_reversed_range() {
+    let error = obolargus_cli::sync::run(load_range(
+        &["TICKER:AAPL"],
+        "2026-10-03",
+        "2026-10-02",
+        2,
+        "json",
+    ))
+    .expect_err("err");
+    assert_eq!(error, "--from 2026-10-03 is later than --to 2026-10-02");
+}
+
+/// A future `--to` is rejected before the database is needed.
+#[test]
+fn load_range_rejects_a_future_to() {
+    let future = (chrono::Utc::now().date_naive() + chrono::Duration::days(1))
+        .format("%Y-%m-%d")
+        .to_string();
+    let error = obolargus_cli::sync::run(load_range(
+        &["TICKER:AAPL"],
+        "2026-10-01",
+        &future,
+        2,
+        "json",
+    ))
+    .expect_err("err");
+    assert!(error.contains("is later than today"), "error: {error}");
+}
+
+/// The window must be in `1..=MAX_CONCURRENCY`.
+#[test]
+fn load_range_rejects_an_invalid_window() {
+    for concurrency in [
+        0,
+        obolargus_core::market_data::load_range::MAX_CONCURRENCY + 1,
+    ] {
+        let error = obolargus_cli::sync::run(load_range(
+            &["TICKER:AAPL"],
+            "2026-10-01",
+            "2026-10-02",
+            concurrency,
+            "json",
+        ))
+        .expect_err("err");
+        assert!(
+            error.contains("--concurrency must be between"),
+            "error: {error}"
+        );
+    }
+}
