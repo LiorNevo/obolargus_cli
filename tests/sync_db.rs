@@ -395,3 +395,51 @@ fn reconcile_reports_the_typed_failure() {
 
     runtime.block_on(truncate(&pool));
 }
+
+// ---------------------------------------------------------------------------
+// Migration bootstrap (2026-10-25)
+// ---------------------------------------------------------------------------
+
+/// Connecting applies pending migrations and never touches existing rows.
+///
+/// A database created before migration 0007 lacks
+/// `reference_data_load_runs`; the CLI must migrate before its first query,
+/// and re-running the connector must be a no-op for already-migrated data.
+#[test]
+fn connecting_applies_pending_migrations_without_touching_existing_rows() {
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    runtime.block_on(async {
+        let Some((pool, url)) = migrated_pool().await else {
+            return;
+        };
+        obolargus_core::common::cleanup(&pool).await;
+
+        let (exists,): (bool,) =
+            sqlx::query_as("SELECT to_regclass('public.reference_data_load_runs') IS NOT NULL")
+                .fetch_one(&pool)
+                .await
+                .expect("to_regclass");
+        assert!(exists, "the 018 table must exist after migrating");
+
+        sqlx::query(
+            "INSERT INTO reference_data_load_runs \
+             (trigger, identifiers_requested_raw, identifiers_attempted) \
+             VALUES ('test', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .expect("sentinel row");
+
+        let second = obolargus_cli::sync::connect_and_migrate(Some(&url), 2)
+            .await
+            .expect("second connection");
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM reference_data_load_runs WHERE trigger = 'test'")
+                .fetch_one(&second)
+                .await
+                .expect("count");
+        assert_eq!(count, 1, "a re-run must not touch existing rows");
+
+        obolargus_core::common::cleanup(&second).await;
+    });
+}

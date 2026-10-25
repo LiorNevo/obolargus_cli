@@ -774,7 +774,7 @@ async fn run_load_range_async(
         // The window is task-level, but each date holds a connection while
         // it queries; size the pool so the window does not queue on it.
         let connections = (args.concurrency.saturating_add(1)).min(u32::MAX as usize) as u32;
-        Some(connect_pool_sized(context.app_config.database_url(), connections.max(4)).await?)
+        Some(connect_and_migrate(context.app_config.database_url(), connections.max(4)).await?)
     };
 
     let report = run_identifier_range_load(
@@ -861,21 +861,42 @@ fn build_runtime_context() -> Result<SyncContext, String> {
 
 /// Connects to the configured PostgreSQL database.
 async fn connect_pool(url: Option<&str>) -> Result<sqlx::PgPool, String> {
-    connect_pool_sized(url, 4).await
+    connect_and_migrate(url, 4).await
 }
 
-/// Connects to the configured PostgreSQL database with a chosen pool size.
-async fn connect_pool_sized(
+/// Connects to PostgreSQL and applies any **pending** migrations.
+///
+/// This runs before any command that touches the database, so a fresh or
+/// partially migrated deployment never reaches a query against a missing
+/// table. It is non-destructive by construction:
+///
+/// - `sqlx` records applied versions in `_sqlx_migrations` and only runs the
+///   files that are not yet recorded, so an up-to-date database is untouched;
+/// - every migration in `obolargus_core/migrations` is additive/idempotent
+///   (`CREATE TABLE IF NOT EXISTS`, guarded `ALTER TABLE`, `CREATE INDEX IF
+///   NOT EXISTS`), so even a database that predates migration tracking is
+///   safe to migrate;
+/// - nothing in this path truncates, drops or rewrites rows.
+///
+/// Concurrent start-ups (CLI plus server) serialise on the advisory lock
+/// `sqlx` takes while migrating.
+pub async fn connect_and_migrate(
     url: Option<&str>,
     max_connections: u32,
 ) -> Result<sqlx::PgPool, String> {
     let url = url
         .ok_or_else(|| "DATABASE_URL is not set; the sync refresh needs a database".to_string())?;
-    sqlx::postgres::PgPoolOptions::new()
+    let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(max_connections)
         .connect(url)
         .await
-        .map_err(|e| format!("database connection error: {e}"))
+        .map_err(|e| format!("database connection error: {e}"))?;
+
+    obolargus_core::bin_helpers::run_migrations(&pool)
+        .await
+        .map_err(|e| format!("database migration error: {e}"))?;
+
+    Ok(pool)
 }
 
 /// Resolves the parsed `--asset` arguments into concrete asset ids.
@@ -911,11 +932,7 @@ async fn resolve_by_identifier(
     let url = database_url.ok_or_else(|| {
         "DATABASE_URL is not set; cannot resolve scheme-qualified identifiers".to_string()
     })?;
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(1)
-        .connect(url)
-        .await
-        .map_err(|e| format!("database connection error: {e}"))?;
+    let pool = connect_and_migrate(Some(url), 1).await?;
 
     let row: Option<(Uuid,)> = sqlx::query_as(
         "SELECT asset_id FROM asset_identifiers WHERE scheme = $1 AND value = $2 \
