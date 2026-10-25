@@ -587,55 +587,32 @@ async fn run_load_async(
 
     let context = resolve_context(context)?;
 
-    if config.dry_run {
+    let pool = if config.dry_run {
         // A dry run persists nothing at all — no reference-data rows and no
-        // run record — and reports an empty run id (FR-008).
-        let output = LoadOutput {
-            report_version: 1,
-            run_id: None,
-            dry_run: true,
-            status: obolargus_core::market_data::load::RunStatus::Complete,
-            requested_source: args.source.clone(),
-            started_at: chrono::Utc::now(),
-            ended_at: chrono::Utc::now(),
-            duration_ms: 0,
-            identifiers_requested_raw: identifiers.len(),
-            identifiers_duplicated: 0,
-            identifiers_attempted: 0,
-            counters: LoadCounters {
-                loaded: 0,
-                no_op: 0,
-                not_resolved: 0,
-                no_data_for_date: 0,
-                unsupported_scheme: 0,
-                rejected: 0,
-                source_unavailable: 0,
-                rate_limited: 0,
-                storage_failure: 0,
-            },
-            per_source_attempted: std::collections::BTreeMap::new(),
-            per_source_failed: std::collections::BTreeMap::new(),
-            identifiers: Vec::new(),
-        };
-        print_load(&output, &args)?;
-        return Ok(());
-    }
+        // run record — and reports an empty run id (FR-008). The core
+        // operation owns that rule; the CLI only passes the flag through.
+        None
+    } else {
+        Some(connect_pool(context.app_config.database_url()).await?)
+    };
 
-    let pool = connect_pool(context.app_config.database_url()).await?;
     let report = run_identifier_load(
-        &pool,
+        pool.as_ref(),
         &context.registry,
         IdentifierLoadConfig {
             identifiers,
             as_of_date,
             preferred_source: args.source.clone(),
             trigger: "cli".to_string(),
+            dry_run: config.dry_run,
         },
     )
     .await
     .map_err(|e| format!("load error: {e}"))?;
 
-    print_load(&LoadOutput::from(&report), &args)?;
+    let mut output = LoadOutput::from(&report);
+    output.dry_run = config.dry_run;
+    print_load(&output, &args)?;
     Ok(())
 }
 
