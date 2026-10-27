@@ -1591,6 +1591,491 @@ mod tests {
         truncate(&pool).await;
     }
 
+    /// A provider that only answers what the load tests need.
+    ///
+    /// `run_load`'s dry run never contacts a provider, but the registry
+    /// still has to be non-empty and the provider has to describe itself.
+    #[test]
+    fn stub_provider_reports_its_identity() {
+        use obolargus_core::market_data::trait_::MarketDataProvider;
+
+        let provider = StubProvider {
+            id: "stub".to_string(),
+            priority: 7,
+            hits: vec![],
+            bar: None,
+        };
+        assert_eq!(provider.source_id(), "stub");
+        assert_eq!(provider.display_name(), "Stub Provider");
+        assert_eq!(provider.priority(), 7);
+        assert!(provider.enabled());
+        assert_eq!(provider.supported_schemes(), ["TICKER".to_string()]);
+    }
+
+    /// One outcome line with every field populated.
+    fn sample_load_outcome() -> obolargus_core::market_data::load::LoadIdentifierOutcome {
+        obolargus_core::market_data::load::LoadIdentifierOutcome {
+            identifier: TypedIdentifier::new("TICKER", "AAPL"),
+            asset_id: Some(Uuid::from_u128(7)),
+            asset_creation: obolargus_core::market_data::load::AssetCreation::NotRequested,
+            attempted: true,
+            outcome: obolargus_core::market_data::load::LoadOutcome::Loaded,
+            source_id: Some("a".to_string()),
+            per_source: Vec::new(),
+        }
+    }
+
+    /// A single-date load report with every counter set.
+    fn sample_load_report() -> IdentifierLoadReport {
+        let at = "2026-01-02T00:00:00Z"
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .expect("timestamp");
+        IdentifierLoadReport {
+            report_version: 1,
+            run_id: Some(Uuid::from_u128(1)),
+            requested_source: Some("a".to_string()),
+            status: obolargus_core::market_data::load::RunStatus::Complete,
+            identifiers_requested_raw: 2,
+            identifiers_duplicated: 1,
+            identifiers_attempted: 1,
+            loaded: 1,
+            no_op: 2,
+            not_resolved: 3,
+            no_data_for_date: 4,
+            unsupported_scheme: 5,
+            rejected: 6,
+            source_unavailable: 7,
+            rate_limited: 8,
+            storage_failure: 9,
+            assets_created: 10,
+            assets_adopted: 11,
+            per_source_attempted: std::collections::BTreeMap::from([("a".to_string(), 1)]),
+            per_source_failed: std::collections::BTreeMap::from([("a".to_string(), 0)]),
+            identifiers: vec![sample_load_outcome()],
+            started_at: at,
+            ended_at: at,
+            duration_ms: 12,
+        }
+    }
+
+    #[test]
+    fn load_output_is_derived_from_a_report_field_by_field() {
+        let report = sample_load_report();
+        let output = LoadOutput::from(&report);
+        assert!(!output.dry_run, "a real run is not a dry run");
+        assert_eq!(output.report_version, 1);
+        assert_eq!(output.run_id, report.run_id);
+        assert_eq!(output.status, report.status);
+        assert_eq!(output.requested_source.as_deref(), Some("a"));
+        assert_eq!(output.identifiers_requested_raw, 2);
+        assert_eq!(output.identifiers_duplicated, 1);
+        assert_eq!(output.identifiers_attempted, 1);
+        assert_eq!(output.counters.loaded, 1);
+        assert_eq!(output.counters.no_op, 2);
+        assert_eq!(output.counters.not_resolved, 3);
+        assert_eq!(output.counters.no_data_for_date, 4);
+        assert_eq!(output.counters.unsupported_scheme, 5);
+        assert_eq!(output.counters.rejected, 6);
+        assert_eq!(output.counters.source_unavailable, 7);
+        assert_eq!(output.counters.rate_limited, 8);
+        assert_eq!(output.counters.storage_failure, 9);
+        assert_eq!(output.counters.assets_created, 10);
+        assert_eq!(output.counters.assets_adopted, 11);
+        assert_eq!(output.per_source_attempted, report.per_source_attempted);
+        assert_eq!(output.per_source_failed, report.per_source_failed);
+        assert_eq!(output.identifiers, report.identifiers);
+    }
+
+    #[test]
+    fn range_load_output_wraps_the_report() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).expect("date");
+        let report = IdentifierRangeLoadReport {
+            report_version: 1,
+            from: date,
+            to: date,
+            concurrency: 2,
+            status: obolargus_core::market_data::load::RunStatus::Complete,
+            dates_requested: 1,
+            dates_with_loads: 1,
+            dates_with_nothing_stored: 0,
+            totals: obolargus_core::market_data::load_range::RangeLoadTotals::default(),
+            run_ids: vec![Some(Uuid::from_u128(1))],
+            dates: vec![obolargus_core::market_data::load_range::DateLoadSection {
+                date,
+                report: sample_load_report(),
+            }],
+            started_at: "2026-01-02T00:00:00Z".parse().expect("timestamp"),
+            ended_at: "2026-01-02T00:00:01Z".parse().expect("timestamp"),
+            duration_ms: 1_000,
+        };
+        let output = RangeLoadOutput::from(&report);
+        assert!(!output.dry_run);
+        assert_eq!(output.report, report);
+    }
+
+    #[test]
+    fn print_load_renders_the_table_and_json_formats() {
+        let report = sample_load_report();
+        let output = LoadOutput::from(&report);
+        let table = LoadArgs {
+            identifiers: vec!["TICKER:AAPL".to_string()],
+            date: "2026-01-02".to_string(),
+            source: None,
+            create_missing_assets: false,
+            format: "table".to_string(),
+        };
+        assert!(print_load(&output, &table).is_ok());
+
+        let json = LoadArgs {
+            format: "json".to_string(),
+            ..table
+        };
+        assert!(print_load(&output, &json).is_ok());
+    }
+
+    #[test]
+    fn print_load_table_reports_an_empty_identifier_list() {
+        let mut output = LoadOutput::from(&sample_load_report());
+        output.identifiers.clear();
+        let args = LoadArgs {
+            identifiers: vec![],
+            date: "2026-01-02".to_string(),
+            source: None,
+            create_missing_assets: false,
+            format: "table".to_string(),
+        };
+        assert!(print_load(&output, &args).is_ok());
+    }
+
+    #[test]
+    fn print_load_range_renders_the_table_and_json_formats() {
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).expect("date");
+        let report = IdentifierRangeLoadReport {
+            report_version: 1,
+            from: date,
+            to: date,
+            concurrency: 1,
+            status: obolargus_core::market_data::load::RunStatus::Complete,
+            dates_requested: 1,
+            dates_with_loads: 1,
+            dates_with_nothing_stored: 0,
+            totals: obolargus_core::market_data::load_range::RangeLoadTotals {
+                loaded: 1,
+                rejected: 1,
+                source_unavailable: 1,
+                rate_limited: 1,
+                storage_failure: 1,
+                ..Default::default()
+            },
+            run_ids: vec![None],
+            dates: vec![obolargus_core::market_data::load_range::DateLoadSection {
+                date,
+                report: sample_load_report(),
+            }],
+            started_at: "2026-01-02T00:00:00Z".parse().expect("timestamp"),
+            ended_at: "2026-01-02T00:00:01Z".parse().expect("timestamp"),
+            duration_ms: 1_000,
+        };
+        let output = RangeLoadOutput::from(&report);
+        let table = LoadRangeArgs {
+            identifiers: vec!["TICKER:AAPL".to_string()],
+            from: "2026-01-02".to_string(),
+            to: "2026-01-02".to_string(),
+            concurrency: 1,
+            source: None,
+            create_missing_assets: false,
+            format: "table".to_string(),
+        };
+        assert!(print_load_range(&output, &table).is_ok());
+        let json = LoadRangeArgs {
+            format: "json".to_string(),
+            ..table
+        };
+        assert!(print_load_range(&output, &json).is_ok());
+    }
+
+    #[tokio::test]
+    async fn load_short_circuits_invalid_arguments() {
+        let base = LoadArgs {
+            identifiers: vec!["TICKER:AAPL".to_string()],
+            date: "2026-01-02".to_string(),
+            source: None,
+            create_missing_assets: false,
+            format: "json".to_string(),
+        };
+        let config = SyncConfig { dry_run: true };
+
+        let error = run_load_async(
+            LoadArgs {
+                format: "xml".to_string(),
+                ..base.clone()
+            },
+            config.clone(),
+            None,
+        )
+        .await
+        .expect_err("unknown format");
+        assert!(error.contains("unknown --format"));
+
+        let error = run_load_async(
+            LoadArgs {
+                identifiers: vec!["AAPL".to_string()],
+                ..base.clone()
+            },
+            config.clone(),
+            None,
+        )
+        .await
+        .expect_err("bad identifier");
+        assert!(error.contains("<type>:<value>"));
+
+        let error = run_load_async(
+            LoadArgs {
+                identifiers: vec![],
+                ..base.clone()
+            },
+            config.clone(),
+            None,
+        )
+        .await
+        .expect_err("empty identifiers");
+        assert!(error.contains("--identifier is required"));
+
+        let error = run_load_async(
+            LoadArgs {
+                date: "02/01/2026".to_string(),
+                ..base
+            },
+            config,
+            None,
+        )
+        .await
+        .expect_err("bad date");
+        assert!(error.contains("not a valid YYYY-MM-DD"));
+    }
+
+    #[tokio::test]
+    async fn load_dry_run_prints_the_report_without_a_database() {
+        let context = context_with(vec![StubProvider {
+            id: "a".to_string(),
+            priority: 10,
+            hits: vec![],
+            bar: None,
+        }]);
+        let config = SyncConfig { dry_run: true };
+        let args = LoadArgs {
+            identifiers: vec!["TICKER:AAPL".to_string()],
+            date: "2026-01-02".to_string(),
+            source: None,
+            create_missing_assets: true,
+            format: "table".to_string(),
+        };
+        run_load_async(args.clone(), config, Some(&context))
+            .await
+            .expect("dry-run table");
+        run_load_async(
+            LoadArgs {
+                format: "json".to_string(),
+                ..args
+            },
+            SyncConfig { dry_run: true },
+            Some(&context),
+        )
+        .await
+        .expect("dry-run json");
+    }
+
+    #[tokio::test]
+    async fn load_range_short_circuits_invalid_arguments() {
+        let base = LoadRangeArgs {
+            identifiers: vec!["TICKER:AAPL".to_string()],
+            from: "2026-01-02".to_string(),
+            to: "2026-01-03".to_string(),
+            concurrency: 1,
+            source: None,
+            create_missing_assets: false,
+            format: "json".to_string(),
+        };
+        let config = SyncConfig { dry_run: true };
+        let today = chrono::Utc::now().date_naive();
+
+        let cases = [
+            (
+                LoadRangeArgs {
+                    format: "xml".to_string(),
+                    ..base.clone()
+                },
+                "unknown --format",
+            ),
+            (
+                LoadRangeArgs {
+                    identifiers: vec!["AAPL".to_string()],
+                    ..base.clone()
+                },
+                "<type>:<value>",
+            ),
+            (
+                LoadRangeArgs {
+                    identifiers: vec![],
+                    ..base.clone()
+                },
+                "--identifier is required",
+            ),
+            (
+                LoadRangeArgs {
+                    from: "02/01/2026".to_string(),
+                    ..base.clone()
+                },
+                "not a valid YYYY-MM-DD",
+            ),
+            (
+                LoadRangeArgs {
+                    to: "03/01/2026".to_string(),
+                    ..base.clone()
+                },
+                "not a valid YYYY-MM-DD",
+            ),
+            (
+                LoadRangeArgs {
+                    from: "2026-01-03".to_string(),
+                    to: "2026-01-02".to_string(),
+                    ..base.clone()
+                },
+                "is later than --to",
+            ),
+            (
+                LoadRangeArgs {
+                    from: today.to_string(),
+                    to: (today + chrono::Days::new(1)).to_string(),
+                    ..base.clone()
+                },
+                "is later than today",
+            ),
+            (
+                LoadRangeArgs {
+                    concurrency: 0,
+                    ..base.clone()
+                },
+                "--concurrency must be between",
+            ),
+            (
+                LoadRangeArgs {
+                    concurrency: usize::MAX,
+                    ..base
+                },
+                "--concurrency must be between",
+            ),
+        ];
+
+        for (args, expected) in cases {
+            let error = run_load_range_async(args, config.clone(), None)
+                .await
+                .expect_err("invalid arguments");
+            assert!(
+                error.contains(expected),
+                "expected {expected:?}, got {error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn load_range_dry_run_prints_the_report_without_a_database() {
+        let context = context_with(vec![StubProvider {
+            id: "a".to_string(),
+            priority: 10,
+            hits: vec![],
+            bar: None,
+        }]);
+        let args = LoadRangeArgs {
+            identifiers: vec!["TICKER:AAPL".to_string()],
+            from: "2026-01-02".to_string(),
+            to: "2026-01-03".to_string(),
+            concurrency: 2,
+            source: None,
+            create_missing_assets: false,
+            format: "table".to_string(),
+        };
+        run_load_range_async(args.clone(), SyncConfig { dry_run: true }, Some(&context))
+            .await
+            .expect("dry-run table");
+        run_load_range_async(
+            LoadRangeArgs {
+                format: "json".to_string(),
+                ..args
+            },
+            SyncConfig { dry_run: true },
+            Some(&context),
+        )
+        .await
+        .expect("dry-run json");
+    }
+
+    /// The real load path writes a run audit row even when the only
+    /// identifier resolves to no asset.
+    #[tokio::test]
+    async fn load_writes_a_run_audit_row() {
+        let Some(url) = std::env::var("TEST_DATABASE_URL")
+            .ok()
+            .or_else(|| std::env::var("DATABASE_URL").ok())
+        else {
+            eprintln!("SKIPPED: no test database configured");
+            return;
+        };
+        let context = context_with_url(
+            vec![StubProvider {
+                id: "a".to_string(),
+                priority: 10,
+                hits: vec![],
+                bar: None,
+            }],
+            &url,
+        );
+        let args = LoadArgs {
+            identifiers: vec![format!("TICKER:LOAD{}", Uuid::new_v4().simple())],
+            date: "2026-01-02".to_string(),
+            source: None,
+            create_missing_assets: false,
+            format: "json".to_string(),
+        };
+        run_load_async(args, SyncConfig { dry_run: false }, Some(&context))
+            .await
+            .expect("a load run writes its audit row");
+    }
+
+    /// The real range path fans out over its dates and writes one audit row
+    /// per date.
+    #[tokio::test]
+    async fn load_range_writes_per_date_audit_rows() {
+        let Some(url) = std::env::var("TEST_DATABASE_URL")
+            .ok()
+            .or_else(|| std::env::var("DATABASE_URL").ok())
+        else {
+            eprintln!("SKIPPED: no test database configured");
+            return;
+        };
+        let context = context_with_url(
+            vec![StubProvider {
+                id: "a".to_string(),
+                priority: 10,
+                hits: vec![],
+                bar: None,
+            }],
+            &url,
+        );
+        let args = LoadRangeArgs {
+            identifiers: vec![format!("TICKER:RANGE{}", Uuid::new_v4().simple())],
+            from: "2026-01-02".to_string(),
+            to: "2026-01-03".to_string(),
+            concurrency: 1,
+            source: None,
+            create_missing_assets: false,
+            format: "table".to_string(),
+        };
+        run_load_range_async(args, SyncConfig { dry_run: false }, Some(&context))
+            .await
+            .expect("a range load writes its audit rows");
+    }
+
     /// Truncates every table the reconciliation touches.
     async fn truncate(pool: &sqlx::PgPool) {
         for table in [

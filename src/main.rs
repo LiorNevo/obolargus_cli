@@ -10,8 +10,8 @@
 use obolargus_cli::run;
 
 fn main() {
-    if let Err(message) = run(std::env::args().collect()) {
-        eprintln!("{message}");
-        std::process::exit(1);
+    if let Err(error) = run(std::env::args().collect()) {
+        eprintln!("{}", error.message);
+        std::process::exit(error.code);
     }
 }

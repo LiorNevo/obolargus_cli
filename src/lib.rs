@@ -18,9 +18,73 @@
 use clap::{Parser, Subcommand};
 
 pub mod sync;
+pub mod temporal;
 
 /// The `sync` subcommand family.
 pub use sync::{SyncArgs, SyncCommand};
+/// The `temporal` subcommand family.
+pub use temporal::{TemporalArgs, TemporalCommand};
+
+/// A CLI failure carrying the process exit code from
+/// `specs/021-bitemporal-market-data/contracts/cli-contract.md` §8.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliError {
+    /// The process exit code.
+    pub code: i32,
+    /// The message printed to stderr.
+    pub message: String,
+}
+
+impl CliError {
+    /// Exit code 1: infrastructure or unexpected failure.
+    pub fn infrastructure(message: impl Into<String>) -> Self {
+        Self {
+            code: 1,
+            message: message.into(),
+        }
+    }
+    /// Exit code 2: usage error.
+    pub fn usage(message: impl Into<String>) -> Self {
+        Self {
+            code: 2,
+            message: message.into(),
+        }
+    }
+    /// Exit code 3: no value at the requested instant.
+    pub fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            code: 3,
+            message: message.into(),
+        }
+    }
+    /// Exit code 5: verification failed.
+    pub fn verification_failed(message: impl Into<String>) -> Self {
+        Self {
+            code: 5,
+            message: message.into(),
+        }
+    }
+    /// Exit code 1 with an explicit "not delivered yet" message. Kept
+    /// distinct so the wording is uniform across forwards-compatible verbs.
+    pub fn not_implemented(message: impl Into<String>) -> Self {
+        Self {
+            code: 1,
+            message: format!("not implemented: {}", message.into()),
+        }
+    }
+}
+
+impl From<String> for CliError {
+    fn from(message: String) -> Self {
+        Self::infrastructure(message)
+    }
+}
+
+impl From<&str> for CliError {
+    fn from(message: &str) -> Self {
+        Self::infrastructure(message.to_string())
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -45,10 +109,12 @@ pub enum Command {
     Report,
     /// Synchronize market data (placeholder)
     Sync(sync::SyncArgs),
+    /// Bitemporal facts, positions, valuations, retention, and verification.
+    Temporal(temporal::TemporalArgs),
 }
 
 /// Runs the CLI, returning an error message for non-zero exit paths.
-pub fn run(args: Vec<String>) -> Result<(), String> {
+pub fn run(args: Vec<String>) -> Result<(), CliError> {
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
         Err(error) => {
@@ -59,7 +125,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
                 print!("{error}");
                 return Ok(());
             }
-            return Err(error.to_string());
+            return Err(CliError::usage(error.to_string()));
         }
     };
     match cli.command {
@@ -67,7 +133,8 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
         Command::Eval => println!("obolargus-cli: eval — placeholder acknowledged"),
         Command::Backtest => println!("obolargus-cli: backtest — placeholder acknowledged"),
         Command::Report => println!("obolargus-cli: report — placeholder acknowledged"),
-        Command::Sync(args) => return sync::run(args),
+        Command::Sync(args) => return sync::run(args).map_err(CliError::from),
+        Command::Temporal(args) => return temporal::run(args),
     }
     Ok(())
 }
