@@ -1622,6 +1622,7 @@ mod tests {
             outcome: obolargus_core::market_data::load::LoadOutcome::Loaded,
             source_id: Some("a".to_string()),
             per_source: Vec::new(),
+            stored: None,
         }
     }
 
@@ -1633,6 +1634,8 @@ mod tests {
         IdentifierLoadReport {
             report_version: 1,
             run_id: Some(Uuid::from_u128(1)),
+            data_domain: obolargus_core::market_data::DataDomain::MarketData,
+            as_of_date: Some(chrono::NaiveDate::from_ymd_opt(2026, 1, 2).expect("date")),
             requested_source: Some("a".to_string()),
             status: obolargus_core::market_data::load::RunStatus::Complete,
             identifiers_requested_raw: 2,
@@ -1691,6 +1694,8 @@ mod tests {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).expect("date");
         let report = IdentifierRangeLoadReport {
             report_version: 1,
+            data_domain: obolargus_core::market_data::DataDomain::MarketData,
+            range_group_id: Uuid::from_u128(99),
             from: date,
             to: date,
             concurrency: 2,
@@ -1752,6 +1757,8 @@ mod tests {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).expect("date");
         let report = IdentifierRangeLoadReport {
             report_version: 1,
+            data_domain: obolargus_core::market_data::DataDomain::MarketData,
+            range_group_id: Uuid::from_u128(99),
             from: date,
             to: date,
             concurrency: 1,
