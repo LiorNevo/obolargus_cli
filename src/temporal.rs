@@ -17,9 +17,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use obolargus_core::temporal::facts::read::{fact_as_known, fact_at, fact_history, fact_series};
-use obolargus_core::temporal::facts::write::{append_fact, revoke_fact};
 use obolargus_core::temporal::instant::TemporalWindow;
 use obolargus_core::temporal::verify::{verify_lookahead, verify_parity};
+use obolargus_core::temporal::{FactInput, FactValue, RetractionInput, retract_fact, write_fact};
 use obolargus_core::temporal::{FactPoint, FactSubject, KnownAt, TemporalError, ValidAt};
 
 use crate::CliError;
@@ -342,14 +342,16 @@ async fn run_facts(
         )),
         FactsCommand::Append(append) => {
             let subject = parse_subject(&append.subject)?;
-            let point = append_fact(
+            let point = write_fact(
                 pool,
-                subject,
-                &append.fact_type,
-                parse_valid_at(&append.at)?,
-                parse_known_at(&append.known_at)?,
-                &append.value,
-                &append.source,
+                FactInput {
+                    subject,
+                    fact_type: append.fact_type.clone(),
+                    valid_at: parse_valid_at(&append.at)?,
+                    known_at: parse_known_at(&append.known_at)?,
+                    source: append.source.clone(),
+                    value: parse_fact_value(&append.value)?,
+                },
             )
             .await?;
             emit(args, &point, || render_point(&point));
@@ -357,14 +359,16 @@ async fn run_facts(
         }
         FactsCommand::Retract(retract) => {
             let subject = parse_subject(&retract.subject)?;
-            let point = revoke_fact(
+            let point = retract_fact(
                 pool,
-                subject,
-                &retract.fact_type,
-                parse_valid_at(&retract.at)?,
-                parse_known_at(&retract.known_at)?,
-                &retract.reason,
-                &retract.source,
+                RetractionInput {
+                    subject,
+                    fact_type: retract.fact_type.clone(),
+                    valid_at: parse_valid_at(&retract.at)?,
+                    known_at: parse_known_at(&retract.known_at)?,
+                    source: retract.source.clone(),
+                    reason: retract.reason.clone(),
+                },
             )
             .await?;
             emit(args, &point, || render_point(&point));
@@ -419,10 +423,21 @@ fn finish_verification(
 }
 
 fn render_point(point: &FactPoint) {
+    let value = point
+        .value
+        .as_ref()
+        .and_then(|value| serde_json::to_string(value).ok())
+        .unwrap_or_else(|| "null".to_string());
     println!(
         "valid_at={} known_at={} source={} retracted={} value={}",
-        point.valid_at, point.known_at, point.source, point.retracted, point.value
+        point.valid_at, point.known_at, point.source, point.retracted, value
     );
+}
+
+/// Parses the catalog-shaped JSON payload accepted by `temporal facts append`.
+fn parse_fact_value(raw: &str) -> Result<FactValue, CliError> {
+    serde_json::from_str(raw)
+        .map_err(|error| CliError::usage(format!("--value is not a valid fact value: {error}")))
 }
 
 fn emit<T: Serialize>(args: &TemporalArgs, value: &T, human: impl FnOnce()) {
@@ -599,7 +614,9 @@ mod tests {
 
     async fn drop_asset(pool: &PgPool, id: Uuid) {
         for statement in [
-            "DELETE FROM asset_reference_data WHERE asset_id = $1",
+            "DELETE FROM fact_reconciliations WHERE subject_kind = 'asset' AND subject_id = $1",
+            "DELETE FROM market_observations WHERE asset_id = $1",
+            "DELETE FROM temporal_facts WHERE asset_id = $1",
             "DELETE FROM assets WHERE id = $1",
         ] {
             sqlx::query(statement)
@@ -785,6 +802,7 @@ mod tests {
             id: Uuid::new_v4(),
             subject: parse_subject("asset:02100000-0000-0000-0000-000000000001").expect("subject"),
             fact_type: "market_price".to_string(),
+            schema_version: 1,
             valid_at: ValidAt::new(
                 "2026-01-02T00:00:00Z"
                     .parse::<DateTime<Utc>>()
@@ -797,9 +815,13 @@ mod tests {
                     .expect("known instant"),
             )
             .expect("known"),
-            value: "{\"close\":\"100\"}".to_string(),
+            value: Some(FactValue::Text {
+                value: "100".to_string(),
+            }),
             source: "cli-test".to_string(),
             retracted: false,
+            retraction_reason: None,
+            content_hash: "hash".to_string(),
         };
 
         render_point(&point);
@@ -1033,7 +1055,7 @@ mod tests {
                 fact_type: "market_price".to_string(),
                 at: "2026-02-01".to_string(),
                 known_at: "2026-02-02T00:00:00Z".to_string(),
-                value: "{\"close\":\"100\"}".to_string(),
+                value: "{\"type\":\"market_price\",\"open\":\"100\",\"high\":\"100\",\"low\":\"100\",\"close\":\"100\",\"adjclose\":\"100\",\"volume\":\"1000\",\"currency\":\"USD\",\"adjustment\":\"unadjusted\"}".to_string(),
                 source: source.clone(),
             })),
             Some(&url),
@@ -1141,7 +1163,7 @@ mod tests {
                 fact_type: "market_price".to_string(),
                 at: "2026-02-01".to_string(),
                 known_at: "2026-02-03T00:00:00Z".to_string(),
-                value: "{\"close\":\"101\"}".to_string(),
+                value: "{\"type\":\"market_price\",\"open\":\"101\",\"high\":\"101\",\"low\":\"101\",\"close\":\"101\",\"adjclose\":\"101\",\"volume\":\"1000\",\"currency\":\"USD\",\"adjustment\":\"unadjusted\"}".to_string(),
                 source: source.clone(),
             })),
             Some(&url),

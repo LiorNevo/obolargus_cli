@@ -65,6 +65,10 @@ async fn migrated_pool() -> Option<(sqlx::PgPool, String)> {
         eprintln!("SKIPPED: could not apply the migrations: {error}");
         return None;
     }
+    if let Err(error) = obolargus_core::temporal::catalog::sync_fact_catalog(&pool).await {
+        eprintln!("SKIPPED: could not sync the fact catalog: {error}");
+        return None;
+    }
     Some((pool, url))
 }
 
@@ -132,14 +136,22 @@ impl Drop for CliEnv {
 /// Truncates every table the tests touch so each case starts clean.
 async fn truncate(pool: &sqlx::PgPool) {
     for table in [
-        "asset_reference_data",
+        "fact_text_values",
+        "fact_decimal_values",
+        "fact_integer_values",
+        "fact_boolean_values",
+        "fact_date_values",
+        "fact_timestamp_values",
+        "temporal_facts",
+        "market_observations",
+        "fact_reconciliations",
+        "data_source_fact_types",
         "asset_identifiers",
         "positions",
         "events",
         "assets",
         "issuers",
         "portfolios",
-        "data_source_reconciliation_audits",
         "data_source_refresh_runs",
         "data_sources",
     ] {

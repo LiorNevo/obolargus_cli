@@ -205,8 +205,8 @@ pub struct LookupOutput {
 pub struct ReconcileOutput {
     /// The reconciliation audit row's id.
     pub reconciliation_id: Uuid,
-    /// The chosen canonical value, as the serialized JSON payload.
-    pub canonical_value: String,
+    /// The chosen canonical value, as typed JSON.
+    pub canonical_value: serde_json::Value,
     /// The number of sources consulted.
     pub sources_tried: usize,
 }
@@ -608,7 +608,7 @@ async fn run_reconcile_async(
             "{}",
             render(&ReconcileOutput {
                 reconciliation_id: Uuid::nil(),
-                canonical_value: String::new(),
+                canonical_value: serde_json::Value::Null,
                 sources_tried: context.registry.enabled_count(),
             })?
         );
@@ -1138,7 +1138,7 @@ mod tests {
     fn reconcile_output_serializes_all_fields() {
         let output = ReconcileOutput {
             reconciliation_id: Uuid::nil(),
-            canonical_value: "{\"close\":\"100\"}".to_string(),
+            canonical_value: serde_json::json!({"type": "market_price", "close": "100"}),
             sources_tried: 2,
         };
         let json = render(&output).expect("render");
@@ -1214,7 +1214,7 @@ mod tests {
         let summary = ReconcileSummary {
             reconciliation_id: Uuid::nil(),
             per_source_answers,
-            canonical_value: "{\"close\":\"100\"}".to_string(),
+            canonical_value: serde_json::json!({"type": "market_price", "close": "100"}),
         };
         let output = ReconcileOutput::from(&summary);
         assert_eq!(output.reconciliation_id, summary.reconciliation_id);
@@ -1518,6 +1518,10 @@ mod tests {
             eprintln!("SKIPPED: could not apply the migrations: {error}");
             return;
         }
+        if let Err(error) = obolargus_core::temporal::catalog::sync_fact_catalog(&pool).await {
+            eprintln!("SKIPPED: could not sync the fact catalog: {error}");
+            return;
+        }
         truncate(&pool).await;
 
         // An asset carrying a `TICKER` identifier.
@@ -1581,11 +1585,10 @@ mod tests {
         );
 
         // The reconciliation wrote its audit row.
-        let audits: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM data_source_reconciliation_audits")
-                .fetch_one(&pool)
-                .await
-                .expect("count audits");
+        let audits: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fact_reconciliations")
+            .fetch_one(&pool)
+            .await
+            .expect("count audits");
         assert_eq!(audits, 1, "the reconciliation must write an audit row");
 
         truncate(&pool).await;
@@ -2086,10 +2089,18 @@ mod tests {
     /// Truncates every table the reconciliation touches.
     async fn truncate(pool: &sqlx::PgPool) {
         for table in [
-            "asset_reference_data",
+            "fact_text_values",
+            "fact_decimal_values",
+            "fact_integer_values",
+            "fact_boolean_values",
+            "fact_date_values",
+            "fact_timestamp_values",
+            "temporal_facts",
+            "market_observations",
+            "fact_reconciliations",
+            "data_source_fact_types",
             "asset_identifiers",
             "assets",
-            "data_source_reconciliation_audits",
             "data_source_refresh_runs",
             "data_sources",
         ] {
