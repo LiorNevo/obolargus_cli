@@ -21,3 +21,7 @@ Operational rules for contributors and AI agents working in this crate.
 - Lint: `cargo clippy --all-targets -- -D warnings`
 - Coverage: `cargo llvm-cov --all-targets --no-fail-fast`
 - Try it: `cargo run -- import`.
+- Export the data-dictionary schema: `cargo run -- schema export` or
+  `cargo run -- schema export --output <PATH>`. It reads no database or
+  network state and must emit the same canonical bytes as the library,
+  HTTP, and committed artifact surfaces.

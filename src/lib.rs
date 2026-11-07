@@ -17,9 +17,12 @@
 
 use clap::{Parser, Subcommand};
 
+pub mod schema;
 pub mod sync;
 pub mod temporal;
 
+/// The `schema` subcommand family.
+pub use schema::{SchemaArgs, SchemaCommand};
 /// The `sync` subcommand family.
 pub use sync::{SyncArgs, SyncCommand};
 /// The `temporal` subcommand family.
@@ -111,6 +114,8 @@ pub enum Command {
     Sync(sync::SyncArgs),
     /// Bitemporal facts, positions, valuations, retention, and verification.
     Temporal(temporal::TemporalArgs),
+    /// Export the complete system data dictionary as JSON Schema.
+    Schema(schema::SchemaArgs),
 }
 
 /// Runs the CLI, returning an error message for non-zero exit paths.
@@ -135,6 +140,7 @@ pub fn run(args: Vec<String>) -> Result<(), CliError> {
         Command::Report => println!("obolargus-cli: report — placeholder acknowledged"),
         Command::Sync(args) => return sync::run(args).map_err(CliError::from),
         Command::Temporal(args) => return temporal::run(args),
+        Command::Schema(args) => return schema::run(args),
     }
     Ok(())
 }
