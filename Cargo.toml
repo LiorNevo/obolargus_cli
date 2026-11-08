@@ -9,24 +9,35 @@ rust-version.workspace = true
 obolargus-core = { path = "../obolargus_core" }
 obolargus-server = { path = "../obolargus_server" }
 lx_engine = { path = "../lx_engine" }
-clap = { version = "4.6.6", features = ["derive"] }
-tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
-sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "macros", "uuid"] }
+clap = { version = "4.6.7", features = ["derive"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
+sqlx = { version = "0.9.0", default-features = false, features = [
+  "runtime-tokio",
+  "postgres",
+  "macros",
+  "uuid",
+] }
 serde.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 envconfig = "0.11.1"
 dotenvy = "0.15.7"
-uuid = { version = "1.18", features = ["v4", "serde"] }
+uuid = { version = "1.29.1", features = ["v4", "serde"] }
 
 # Integration tests under `tests/` link against the crate as an external
 # crate, so anything they `use` directly must also be a dev-dependency.
 # These mirror the regular dependencies above and add nothing to the
 # release build.
 [dev-dependencies]
-async-trait = "0.1"
+async-trait = "0.1.92"
 chrono.workspace = true
 rust_decimal.workspace = true
-sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "postgres", "macros", "uuid", "migrate"] }
-tokio = { version = "1.53", features = ["macros", "rt-multi-thread"] }
-uuid = { version = "1.18", features = ["v4", "serde"] }
+sqlx = { version = "0.9.0", default-features = false, features = [
+  "runtime-tokio",
+  "postgres",
+  "macros",
+  "uuid",
+  "migrate",
+] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
+uuid = { version = "1.29.1", features = ["v4", "serde"] }
