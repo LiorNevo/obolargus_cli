@@ -21,6 +21,20 @@ pub mod schema;
 pub mod sync;
 pub mod temporal;
 
+/// Serializes database-backed unit tests that share `TEST_DATABASE_URL`.
+/// Integration tests in `tests/` are separate binaries and use their own
+/// guard.
+#[cfg(test)]
+pub(crate) mod test_lock {
+    use tokio::sync::{Mutex, MutexGuard};
+
+    static DB_LOCK: Mutex<()> = Mutex::const_new(());
+
+    pub(crate) async fn lock() -> MutexGuard<'static, ()> {
+        DB_LOCK.lock().await
+    }
+}
+
 /// The `schema` subcommand family.
 pub use schema::{SchemaArgs, SchemaCommand};
 /// The `sync` subcommand family.

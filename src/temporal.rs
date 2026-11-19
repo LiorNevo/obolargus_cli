@@ -1041,6 +1041,7 @@ mod tests {
             return;
         };
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let _db = runtime.block_on(crate::test_lock::lock());
         let Some(pool) = runtime.block_on(migrated_pool(&url)) else {
             return;
         };

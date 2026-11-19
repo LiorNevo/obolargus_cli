@@ -19,12 +19,12 @@
 //! within a runtime"), so the tests own a runtime for their own database
 //! work and call the CLI outside of it.
 //!
-//! **Serial execution required.** These tests mutate the process
-//! environment (`DATABASE_URL`, `OBOLARGUS_SYNC_DRY_RUN`,
+//! **Serial execution is enforced in code.** These tests mutate the
+//! process environment (`DATABASE_URL`, `OBOLARGUS_SYNC_DRY_RUN`,
 //! `MARKET_DATA_SOURCES`) because the CLI reads its configuration through
-//! `envconfig`. The workspace sets `RUST_TEST_THREADS=1` in the root
-//! `.cargo/config.toml`, so no other thread can observe an inconsistent
-//! environment.
+//! `envconfig`, and they truncate shared tables. Every test takes
+//! `TEST_LOCK`, so the parallel test harness cannot observe an
+//! inconsistent environment or wipe another test's fixtures.
 //!
 //! They also share the `TEST_DATABASE_URL` database with
 //! `obolargus_core`'s and `obolargus_server`'s integration tests, which
@@ -32,6 +32,15 @@
 //! `Makefile`'s `test` and `coverage` targets do exactly that.
 
 use obolargus_cli::sync::{ReconcileArgs, SyncArgs, SyncCommand};
+
+/// Serializes the database/environment-mutating tests in this binary.
+static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial() -> std::sync::MutexGuard<'static, ()> {
+    TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 /// The market-data configuration used by the tests: a single **disabled**
 /// source. A disabled source is filtered out of the registry, so the
@@ -193,6 +202,7 @@ async fn seed_asset_with_ticker(pool: &sqlx::PgPool, ticker: &str) -> uuid::Uuid
 /// would do without writing anything (FR-030).
 #[test]
 fn refresh_dry_run_resolves_a_uuid_asset() {
+    let _serial = serial();
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let Some((pool, url)) = runtime.block_on(migrated_pool()) else {
         eprintln!("SKIPPED: no test database configured");
@@ -225,6 +235,7 @@ fn refresh_dry_run_resolves_a_uuid_asset() {
 /// `asset_identifiers` table (FR-030).
 #[test]
 fn refresh_dry_run_resolves_a_scheme_qualified_asset() {
+    let _serial = serial();
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let Some((pool, url)) = runtime.block_on(migrated_pool()) else {
         eprintln!("SKIPPED: no test database configured");
@@ -248,6 +259,7 @@ fn refresh_dry_run_resolves_a_scheme_qualified_asset() {
 /// names the pair (FR-030).
 #[test]
 fn refresh_rejects_an_unknown_scheme_qualified_asset() {
+    let _serial = serial();
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let Some((pool, url)) = runtime.block_on(migrated_pool()) else {
         eprintln!("SKIPPED: no test database configured");
@@ -272,6 +284,7 @@ fn refresh_rejects_an_unknown_scheme_qualified_asset() {
 /// (FR-030).
 #[test]
 fn refresh_reports_a_missing_database_url_for_a_typed_asset() {
+    let _serial = serial();
     let _env = CliEnv::install(None, true);
 
     let error = obolargus_cli::sync::run(SyncArgs {
@@ -288,6 +301,7 @@ fn refresh_reports_a_missing_database_url_for_a_typed_asset() {
 /// The refresh needs a database URL even for a bare UUID (FR-030).
 #[test]
 fn refresh_reports_a_missing_database_url() {
+    let _serial = serial();
     let _env = CliEnv::install(None, false);
 
     let error = obolargus_cli::sync::run(SyncArgs {
@@ -309,6 +323,7 @@ fn refresh_reports_a_missing_database_url() {
 /// call is made.
 #[test]
 fn refresh_writes_the_audit_row() {
+    let _serial = serial();
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let Some((pool, url)) = runtime.block_on(migrated_pool()) else {
         eprintln!("SKIPPED: no test database configured");
@@ -352,6 +367,7 @@ fn refresh_writes_the_audit_row() {
 /// touching the database (FR-021).
 #[test]
 fn reconcile_dry_run_reports_the_enabled_source_count() {
+    let _serial = serial();
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let Some((pool, url)) = runtime.block_on(migrated_pool()) else {
         eprintln!("SKIPPED: no test database configured");
@@ -378,6 +394,7 @@ fn reconcile_dry_run_reports_the_enabled_source_count() {
 /// failure when the registry does not have two enabled sources (FR-020).
 #[test]
 fn reconcile_reports_the_typed_failure() {
+    let _serial = serial();
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let Some((pool, url)) = runtime.block_on(migrated_pool()) else {
         eprintln!("SKIPPED: no test database configured");
@@ -419,6 +436,7 @@ fn reconcile_reports_the_typed_failure() {
 /// and re-running the connector must be a no-op for already-migrated data.
 #[test]
 fn connecting_applies_pending_migrations_without_touching_existing_rows() {
+    let _serial = serial();
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     runtime.block_on(async {
         let Some((pool, url)) = migrated_pool().await else {

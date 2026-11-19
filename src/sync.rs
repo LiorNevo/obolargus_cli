@@ -1493,6 +1493,7 @@ mod tests {
     /// Skipped when no test database is configured.
     #[tokio::test]
     async fn reconcile_writes_the_canonical_value() {
+        let _db = crate::test_lock::lock().await;
         let Some(url) = std::env::var("TEST_DATABASE_URL")
             .ok()
             .or_else(|| std::env::var("DATABASE_URL").ok())
@@ -1511,15 +1512,8 @@ mod tests {
                 return;
             }
         };
-        if let Err(error) = sqlx::migrate!("../obolargus_core/migrations")
-            .run(&pool)
-            .await
-        {
+        if let Err(error) = obolargus_core::bin_helpers::run_migrations(&pool).await {
             eprintln!("SKIPPED: could not apply the migrations: {error}");
-            return;
-        }
-        if let Err(error) = obolargus_core::temporal::catalog::sync_fact_catalog(&pool).await {
-            eprintln!("SKIPPED: could not sync the fact catalog: {error}");
             return;
         }
         truncate(&pool).await;
@@ -2024,6 +2018,7 @@ mod tests {
     /// identifier resolves to no asset.
     #[tokio::test]
     async fn load_writes_a_run_audit_row() {
+        let _db = crate::test_lock::lock().await;
         let Some(url) = std::env::var("TEST_DATABASE_URL")
             .ok()
             .or_else(|| std::env::var("DATABASE_URL").ok())
@@ -2056,6 +2051,7 @@ mod tests {
     /// per date.
     #[tokio::test]
     async fn load_range_writes_per_date_audit_rows() {
+        let _db = crate::test_lock::lock().await;
         let Some(url) = std::env::var("TEST_DATABASE_URL")
             .ok()
             .or_else(|| std::env::var("DATABASE_URL").ok())
