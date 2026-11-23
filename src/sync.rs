@@ -11,8 +11,10 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use obolargus_core::domain::id::{AssetId, DomainId};
+use obolargus_core::market_data::audit::LoadRunContext;
 use obolargus_core::market_data::load::{
-    DEFAULT_ASSET_CURRENCY, IdentifierLoadConfig, IdentifierLoadReport, run_identifier_load,
+    DEFAULT_ASSET_CURRENCY, IdentifierLoadConfig, IdentifierLoadReport,
+    run_identifier_load_with_snapshot,
 };
 use obolargus_core::market_data::load_range::{
     IdentifierRangeLoadConfig, IdentifierRangeLoadReport, MAX_CONCURRENCY,
@@ -673,9 +675,9 @@ async fn run_load_async(
         Some(connect_pool(context.app_config.database_url()).await?)
     };
 
-    let report = run_identifier_load(
+    let report = run_identifier_load_with_snapshot(
         pool.as_ref(),
-        &context.registry,
+        &context.registry.snapshot(),
         IdentifierLoadConfig {
             identifiers,
             as_of_date,
@@ -685,6 +687,7 @@ async fn run_load_async(
             create_missing_assets: args.create_missing_assets,
             default_currency: DEFAULT_ASSET_CURRENCY.to_string(),
         },
+        &LoadRunContext::market_data(Some(as_of_date)).with_owner("dev-user"),
     )
     .await
     .map_err(|e| format!("load error: {e}"))?;
@@ -805,38 +808,44 @@ async fn run_load_range_async(
 fn print_load_range(output: &RangeLoadOutput, args: &LoadRangeArgs) -> Result<(), String> {
     if args.format == "table" {
         println!(
-            "{:<12} {:<8} {:<8} {:<13} {:<9} {:<9} {:<9}",
-            "DATE", "LOADED", "NO_OP", "NOT_RESOLVED", "NO_DATA", "FAILED", "CREATED"
+            "{:<12} {:<10} {:<8} {:<8} {:<13} {:<9} {:<9} {:<9}",
+            "DATE", "STATUS", "LOADED", "NO_OP", "NOT_RESOLVED", "NO_DATA", "FAILED", "CREATED"
         );
-        for section in &output.report.dates {
-            let report = &section.report;
+        for summary in &output.report.dates {
             println!(
-                "{:<12} {:<8} {:<8} {:<13} {:<9} {:<9} {:<9}",
-                section.date,
-                report.loaded,
-                report.no_op,
-                report.not_resolved,
-                report.no_data_for_date,
-                report.rejected
-                    + report.source_unavailable
-                    + report.rate_limited
-                    + report.storage_failure,
-                report.assets_created,
+                "{:<12} {:<10} {:<8} {:<8} {:<13} {:<9} {:<9} {:<9}",
+                summary.date,
+                serde_json::to_value(summary.status)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "unknown".to_string()),
+                summary.loaded,
+                summary.no_op,
+                summary.not_resolved,
+                summary.no_data_for_date,
+                summary.rejected
+                    + summary.source_unavailable
+                    + summary.rate_limited
+                    + summary.storage_failure,
+                summary.assets_created,
             );
         }
-        let totals = &output.report.totals;
         println!(
-            "{:<12} {:<8} {:<8} {:<13} {:<9} {:<9} {:<9}",
+            "{:<12} {:<10} {:<8} {:<8} {:<13} {:<9} {:<9} {:<9}",
+            format!(
+                "{}/{}",
+                output.report.dates_completed, output.report.dates_requested
+            ),
             "TOTAL",
-            totals.loaded,
-            totals.no_op,
-            totals.not_resolved,
-            totals.no_data_for_date,
-            totals.rejected
-                + totals.source_unavailable
-                + totals.rate_limited
-                + totals.storage_failure,
-            totals.assets_created,
+            output.report.totals.loaded,
+            output.report.totals.no_op,
+            output.report.totals.not_resolved,
+            output.report.totals.no_data_for_date,
+            output.report.totals.rejected
+                + output.report.totals.source_unavailable
+                + output.report.totals.rate_limited
+                + output.report.totals.storage_failure,
+            output.report.totals.assets_created,
         );
         return Ok(());
     }
@@ -845,8 +854,12 @@ fn print_load_range(output: &RangeLoadOutput, args: &LoadRangeArgs) -> Result<()
 }
 
 /// Loads the app configuration and builds the market-data registry.
+///
+/// The server's cross-field `validate()` is intentionally skipped: the CLI
+/// only reads `DATABASE_URL` and the market-data sources, both of which are
+/// validated by the calls below, and it never serves authenticated traffic.
 fn build_runtime_context() -> Result<SyncContext, String> {
-    let app_config = obolargus_server::config::AppConfig::from_env()
+    let app_config = obolargus_server::config::AppConfig::init_from_env()
         .map_err(|e| format!("config error: {e}"))?;
     let market_data = app_config
         .market_data_config()
@@ -1686,9 +1699,38 @@ mod tests {
         assert_eq!(output.identifiers, report.identifiers);
     }
 
+    fn sample_range_summary(
+        date: chrono::NaiveDate,
+        report: &IdentifierLoadReport,
+    ) -> obolargus_core::market_data::load_range::DateLoadSummary {
+        obolargus_core::market_data::load_range::DateLoadSummary {
+            date,
+            run_id: report.run_id,
+            status: report.status,
+            identifiers_attempted: report.identifiers_attempted,
+            loaded: report.loaded,
+            no_op: report.no_op,
+            not_resolved: report.not_resolved,
+            no_data_for_date: report.no_data_for_date,
+            unsupported_scheme: report.unsupported_scheme,
+            rejected: report.rejected,
+            source_unavailable: report.source_unavailable,
+            rate_limited: report.rate_limited,
+            storage_failure: report.storage_failure,
+            assets_created: report.assets_created,
+            assets_adopted: report.assets_adopted,
+            per_source_attempted: report.per_source_attempted.clone(),
+            per_source_failed: report.per_source_failed.clone(),
+            started_at: report.started_at,
+            ended_at: report.ended_at,
+            duration_ms: report.duration_ms,
+        }
+    }
+
     #[test]
     fn range_load_output_wraps_the_report() {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).expect("date");
+        let sample = sample_load_report();
         let report = IdentifierRangeLoadReport {
             report_version: 1,
             data_domain: obolargus_core::market_data::DataDomain::MarketData,
@@ -1698,14 +1740,13 @@ mod tests {
             concurrency: 2,
             status: obolargus_core::market_data::load::RunStatus::Complete,
             dates_requested: 1,
+            dates_completed: 1,
+            dates_failed: 0,
             dates_with_loads: 1,
             dates_with_nothing_stored: 0,
             totals: obolargus_core::market_data::load_range::RangeLoadTotals::default(),
             run_ids: vec![Some(Uuid::from_u128(1))],
-            dates: vec![obolargus_core::market_data::load_range::DateLoadSection {
-                date,
-                report: sample_load_report(),
-            }],
+            dates: vec![sample_range_summary(date, &sample)],
             started_at: "2026-01-02T00:00:00Z".parse().expect("timestamp"),
             ended_at: "2026-01-02T00:00:01Z".parse().expect("timestamp"),
             duration_ms: 1_000,
@@ -1752,6 +1793,7 @@ mod tests {
     #[test]
     fn print_load_range_renders_the_table_and_json_formats() {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 2).expect("date");
+        let sample = sample_load_report();
         let report = IdentifierRangeLoadReport {
             report_version: 1,
             data_domain: obolargus_core::market_data::DataDomain::MarketData,
@@ -1761,6 +1803,8 @@ mod tests {
             concurrency: 1,
             status: obolargus_core::market_data::load::RunStatus::Complete,
             dates_requested: 1,
+            dates_completed: 1,
+            dates_failed: 0,
             dates_with_loads: 1,
             dates_with_nothing_stored: 0,
             totals: obolargus_core::market_data::load_range::RangeLoadTotals {
@@ -1772,10 +1816,7 @@ mod tests {
                 ..Default::default()
             },
             run_ids: vec![None],
-            dates: vec![obolargus_core::market_data::load_range::DateLoadSection {
-                date,
-                report: sample_load_report(),
-            }],
+            dates: vec![sample_range_summary(date, &sample)],
             started_at: "2026-01-02T00:00:00Z".parse().expect("timestamp"),
             ended_at: "2026-01-02T00:00:01Z".parse().expect("timestamp"),
             duration_ms: 1_000,
