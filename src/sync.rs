@@ -1191,6 +1191,7 @@ mod tests {
             assets_no_op: 3,
             assets_missing_identifier: 1,
             assets_source_unavailable: 1,
+            latest_completed_session: None,
         };
         let output = SyncOutput::from(&summary);
         assert!(!output.dry_run, "a real run is not a dry run");
@@ -1511,22 +1512,19 @@ mod tests {
             .ok()
             .or_else(|| std::env::var("DATABASE_URL").ok())
         else {
-            eprintln!("SKIPPED: no test database configured");
             return;
         };
-        let pool = match sqlx::postgres::PgPoolOptions::new()
+        let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)
             .connect(&url)
             .await
-        {
-            Ok(pool) => pool,
-            Err(error) => {
-                eprintln!("SKIPPED: could not connect to the test database: {error}");
-                return;
-            }
+        else {
+            return;
         };
-        if let Err(error) = obolargus_core::bin_helpers::run_migrations(&pool).await {
-            eprintln!("SKIPPED: could not apply the migrations: {error}");
+        if obolargus_core::bin_helpers::run_migrations(&pool)
+            .await
+            .is_err()
+        {
             return;
         }
         truncate(&pool).await;
@@ -1655,6 +1653,7 @@ mod tests {
             no_op: 2,
             not_resolved: 3,
             no_data_for_date: 4,
+            calendar_closed: 0,
             unsupported_scheme: 5,
             rejected: 6,
             source_unavailable: 7,
@@ -1712,6 +1711,7 @@ mod tests {
             no_op: report.no_op,
             not_resolved: report.not_resolved,
             no_data_for_date: report.no_data_for_date,
+            calendar_closed: report.calendar_closed,
             unsupported_scheme: report.unsupported_scheme,
             rejected: report.rejected,
             source_unavailable: report.source_unavailable,
@@ -1744,6 +1744,7 @@ mod tests {
             dates_failed: 0,
             dates_with_loads: 1,
             dates_with_nothing_stored: 0,
+            dates_fully_closed: 0,
             totals: obolargus_core::market_data::load_range::RangeLoadTotals::default(),
             run_ids: vec![Some(Uuid::from_u128(1))],
             dates: vec![sample_range_summary(date, &sample)],
@@ -1807,6 +1808,7 @@ mod tests {
             dates_failed: 0,
             dates_with_loads: 1,
             dates_with_nothing_stored: 0,
+            dates_fully_closed: 0,
             totals: obolargus_core::market_data::load_range::RangeLoadTotals {
                 loaded: 1,
                 rejected: 1,
@@ -2064,7 +2066,6 @@ mod tests {
             .ok()
             .or_else(|| std::env::var("DATABASE_URL").ok())
         else {
-            eprintln!("SKIPPED: no test database configured");
             return;
         };
         let context = context_with_url(
@@ -2097,7 +2098,6 @@ mod tests {
             .ok()
             .or_else(|| std::env::var("DATABASE_URL").ok())
         else {
-            eprintln!("SKIPPED: no test database configured");
             return;
         };
         let context = context_with_url(
@@ -2149,5 +2149,58 @@ mod tests {
                 .await
                 .unwrap_or_else(|error| panic!("truncate {table}: {error}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod coverage_edges {
+    use super::*;
+
+    #[tokio::test]
+    async fn reconcile_rejects_invalid_inputs_before_any_context() {
+        let base = ReconcileArgs {
+            asset: "not-a-uuid".to_string(),
+            as_of: "2026-01-02".to_string(),
+            policy: "primary_wins".to_string(),
+        };
+        assert!(
+            run_reconcile_async(base.clone(), SyncConfig { dry_run: true }, None)
+                .await
+                .expect_err("bad uuid")
+                .contains("valid UUID")
+        );
+        let bad_date = ReconcileArgs {
+            asset: Uuid::nil().to_string(),
+            as_of: "not-a-date".to_string(),
+            ..base.clone()
+        };
+        assert!(
+            run_reconcile_async(bad_date, SyncConfig { dry_run: true }, None)
+                .await
+                .expect_err("bad date")
+                .contains("valid YYYY-MM-DD")
+        );
+        let majority = ReconcileArgs {
+            asset: Uuid::nil().to_string(),
+            policy: "majority".to_string(),
+            ..base.clone()
+        };
+        assert!(
+            run_reconcile_async(majority, SyncConfig { dry_run: true }, None)
+                .await
+                .expect_err("majority")
+                .contains("deferred")
+        );
+        let unknown = ReconcileArgs {
+            asset: Uuid::nil().to_string(),
+            policy: "nonsense".to_string(),
+            ..base
+        };
+        assert!(
+            run_reconcile_async(unknown, SyncConfig { dry_run: true }, None)
+                .await
+                .expect_err("unknown policy")
+                .contains("unknown --policy")
+        );
     }
 }
